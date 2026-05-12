@@ -75,9 +75,8 @@ class OptionsEnv(gym.Env):
         self.day += 1
         days_remaining = 252 - self.day
 
-        # 2. Price all open positions before and after the step, compute daily P&L
-        daily_pnl = self._mark_to_market()
-        self.pnl += daily_pnl
+        # 2. Reprice all open positions and update total P&L
+        self.pnl += self._mark_to_market()
 
         # 3. Process action unless do_nothing
         if action["do_nothing"] == 0 and days_remaining > 0:
@@ -90,8 +89,11 @@ class OptionsEnv(gym.Env):
         for p in self.portfolio:
             p["maturite"] -= 1
 
+        # 6. Reward = total P&L, given only at end of each quarter (every 84 days)
         terminated = self.day >= 252
-        return self._get_obs(), daily_pnl, terminated, False, {}
+        reward = self.pnl if (self.day % 84 == 0 or terminated) else 0.0
+
+        return self._get_obs(), reward, terminated, False, {}
 
     # ------------------------------------------------------------------
 
