@@ -75,7 +75,7 @@ from envs.pricing import black_scholes
 
 COMMISSION    = 0.65   # broker fee per contract
 MAX_TRADES    = 15     # max trades per day
-MAX_PORTFOLIO = 50     # max open positions at once
+MAX_PORTFOLIO = 1000     # max open positions at once
 MAX_QTY       = 100    # max contracts per trade
 
 
