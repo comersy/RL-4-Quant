@@ -28,7 +28,7 @@ from envs.pricing import black_scholes
 #     [1]          : current trading day index (int, starts at 0)
 #     [2]          : realized annual vol over the full history so far (float)
 #     [3 : 255]    : price history of the underlying, last 252 values (float x 252)
-#     [255 : 255+H]: P&L history, one value per past trading day (float x H)
+#     [255 : 507]  : P&L history, last 252 trading days, padded with 0 (float x 252)
 #
 #   Portfolio info (up to MAX_PORTFOLIO positions, padded with 0):
 #     per position: [option_type, strike, maturite_restante, quantite, is_short,
