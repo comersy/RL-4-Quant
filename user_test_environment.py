@@ -214,9 +214,14 @@ class TradingApp:
             "entry_price": price,
             "last_price":  price,
         })
+        # broker fees: 0.65 per contract
+        fees = 0.65 * qty
+        self.total_pnl -= fees
+        self.pnl_history[-1] = self.total_pnl
+
         self.log.append(
-            "Day %3d | %s %4s K=%.1f T=%dd qty=%d @ %.4f" % (
-                self.trading_day, direction, option_type.upper(), K, mat, qty, price)
+            "Day %3d | %s %4s K=%.1f T=%dd qty=%d @ %.4f  fees=-%.2f" % (
+                self.trading_day, direction, option_type.upper(), K, mat, qty, price, fees)
         )
         self._refresh()
 
@@ -226,9 +231,14 @@ class TradingApp:
         direction = -1 if p["is_short"] else 1
         # realize the unrealized P&L immediately
         realized = direction * (price - p["entry_price"]) * p["quantite"]
+        # broker fees on close too
+        fees = 0.65 * p["quantite"]
+        self.total_pnl -= fees
+        self.pnl_history[-1] = self.total_pnl
+
         self.log.append(
-            "Day %3d | CLOSE %4s K=%.1f @ %.4f  P&L=%.2f" % (
-                self.trading_day, p["option_type"].upper(), p["strike"], price, realized)
+            "Day %3d | CLOSE %4s K=%.1f @ %.4f  P&L=%.2f  fees=-%.2f" % (
+                self.trading_day, p["option_type"].upper(), p["strike"], price, realized, fees)
         )
         self.portfolio.pop(idx)
         self._refresh()
