@@ -1,7 +1,3 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(__file__))
-
 import tkinter as tk
 import numpy as np
 import matplotlib.pyplot as plt
