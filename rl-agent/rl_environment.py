@@ -54,7 +54,7 @@ from envs.pricing import black_scholes
 #     4 = sell put            → uses strike (float), maturite (int), quantite (int)
 #     5 = close position      → uses close_index (int), points to portfolio position
 #
-#   strike      : Box(-inf, inf, float32)  — desired strike price
+#   strike      : Box(0, inf, float32)  — desired strike price
 #   maturite    : Discrete(252)            — days to expiry, clipped to days available
 #   quantite    : Discrete(MAX_QTY)        — number of contracts (>= 1)
 #   close_index : Discrete(MAX_PORTFOLIO)  — index of position to close
@@ -100,7 +100,7 @@ class OptionsEnv(gym.Env):
         # MAX_TRADES slots, each slot is a Dict
         single_trade = spaces.Dict({
             "type_action":  spaces.Discrete(6),
-            "strike":       spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            "strike":       spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
             "maturite":     spaces.Discrete(252),
             "quantite":     spaces.Discrete(MAX_QTY),
             "close_index":  spaces.Discrete(MAX_PORTFOLIO),
