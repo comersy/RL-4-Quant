@@ -55,7 +55,7 @@ from envs.pricing import black_scholes
 #     5 = close position      → uses close_index (int), points to portfolio position
 #
 #   strike      : Box(0, inf, float32)  — desired strike price
-#   maturite    : Discrete(252)            — days to expiry, clipped to days available
+#   maturite    : Discrete(252, start = 1)            — days to expiry, clipped to days available
 #   quantite    : Discrete(MAX_QTY)        — number of contracts (>= 1)
 #   close_index : Discrete(MAX_PORTFOLIO)  — index of position to close
 #
@@ -75,7 +75,7 @@ from envs.pricing import black_scholes
 
 COMMISSION    = 0.65   # broker fee per contract
 MAX_TRADES    = 15     # max trades per day
-MAX_PORTFOLIO = 1000     # max open positions at once
+MAX_PORTFOLIO = 1000   # max open positions at once
 MAX_QTY       = 100    # max contracts per trade
 
 
@@ -101,7 +101,7 @@ class OptionsEnv(gym.Env):
         single_trade = spaces.Dict({
             "type_action":  spaces.Discrete(6),
             "strike":       spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
-            "maturite":     spaces.Discrete(252),
+            "maturite":     spaces.Discrete(252, start = 1),
             "quantite":     spaces.Discrete(MAX_QTY),
             "close_index":  spaces.Discrete(MAX_PORTFOLIO),
         })
