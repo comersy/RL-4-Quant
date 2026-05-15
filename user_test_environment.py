@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
 )
 
 from data.loader import list_available_days, load_day
+from datetime import datetime
 
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
@@ -146,7 +147,6 @@ class TradingApp(QMainWindow):
         nav_layout = QVBoxLayout(nav)
         nav_layout.setContentsMargins(8, 8, 8, 8)
         nav_layout.addWidget(self._btn("▶  Next Day",  FG,   self._next_day))
-        nav_layout.addWidget(self._btn("⏮  Prev Day",  FG2,  self._prev_day))
         nav_layout.addWidget(self._btn("↺  Restart",   FG2,  self._restart))
         parent.addWidget(nav)
 
@@ -320,7 +320,7 @@ class TradingApp(QMainWindow):
     def _order(self, opt: dict, qty: int, side: str):
         if qty <= 0:
             return
-        price = opt["last_price"]
+        price = opt["avg_price"]
         if side == "BUY":
             self.realized_pnl -= price * qty           # pay the premium
         else:
@@ -331,9 +331,11 @@ class TradingApp(QMainWindow):
             "quantity":    qty,
             "is_short":    side == "SELL",
             "entry_price": price,
-            "last_price":  price,
+            "avg_price":  price,
             "entry_date":  self.days[self.day_index],
         })
+        self.portfolio[-1]["iv_last"] = opt["iv"] if opt["iv"] > 0 else 0.5
+        self.portfolio[-1]["stale"]   = False
         self.log.append(
             f"{self.days[self.day_index]} | {side:4} {opt['option_type'].upper():4} "
             f"K={opt['strike']:.0f} {opt['expiry'].strftime('%d%b%y')} qty={qty} "
@@ -346,7 +348,7 @@ class TradingApp(QMainWindow):
         if idx >= len(self.portfolio):
             return
         p     = self.portfolio[idx]
-        price = p["last_price"]
+        price = p["avg_price"]
         # close = reverse trade at current market price
         if p["is_short"]:
             self.realized_pnl -= price * p["quantity"]    # buy back
@@ -362,15 +364,52 @@ class TradingApp(QMainWindow):
         self._refresh()
 
     def _mark_to_market(self):
-        """Update last_price of open positions using today's data, recompute unrealized P&L."""
+        """Update price of open positions using today's data, handle expirations, recompute unrealized P&L."""
+        from envs.pricing import black_scholes
+        from datetime import datetime
+
         opts_by_instr = {o["instrument"]: o for o in self.current_data["options"]}
-        unrealized = 0.0
+        spot          = self.current_data["spot"]
+        day_today     = datetime.strptime(self.days[self.day_index], "%Y-%m-%d")
+        unrealized    = 0.0
+
         for p in self.portfolio:
+            # 1. Expiration check
+            if p["expiry"] <= day_today:
+                payoff_usd = (max(spot - p["strike"], 0.0) if p["option_type"] == "call"
+                            else max(p["strike"] - spot, 0.0))
+                payoff_btc = payoff_usd / spot
+                sign       = -1 if p["is_short"] else 1
+                # realized: receive payoff (long) or pay it (short)
+                self.realized_pnl += sign * payoff_btc * p["quantity"]
+                self.log.append(
+                    f"{self.days[self.day_index]} | EXPIRED {p['option_type'].upper():4} "
+                    f"K={p['strike']:.0f} payoff={payoff_btc:.4f} BTC qty={p['quantity']}"
+                )
+                p["expired"] = True
+                continue
+
+            # 2. Mark to market with today's price or Black-Scholes fallback
             o = opts_by_instr.get(p["instrument"])
             if o is not None:
-                p["last_price"] = o["last_price"]
-            sign = -1 if p["is_short"] else 1
-            unrealized += sign * (p["last_price"] - p["entry_price"]) * p["quantity"]
+                p["avg_price"] = o["avg_price"]
+                p["iv_last"]   = o["iv"] if o["iv"] > 0 else p.get("iv_last", 50.0)
+                p["stale"]     = False
+            else:
+                days_left = (p["expiry"] - day_today).days
+                T         = max(days_left, 1) / 365
+                sigma     = p.get("iv_last", 50.0) / 100
+                price_usd = black_scholes(S=spot, K=p["strike"], T=T, r=0.0,
+                                        sigma=sigma, option_type=p["option_type"])
+                p["avg_price"] = price_usd / spot
+                p["stale"]     = True
+
+            # 3. Unrealized P&L
+            sign        = -1 if p["is_short"] else 1
+            unrealized += sign * (p["avg_price"] - p["entry_price"]) * p["quantity"]
+
+        # remove expired positions
+        self.portfolio      = [p for p in self.portfolio if not p.get("expired")]
         self.unrealized_pnl = unrealized
 
     # ── Refresh UI ────────────────────────────────────────────────────────────
@@ -404,7 +443,10 @@ class TradingApp(QMainWindow):
         self.canvas.draw()
 
     def _fill_options_table(self):
-        opts = sorted(self.current_data["options"], key=lambda o: (o["expiry"], o["strike"]))
+        opts = sorted(
+            [o for o in self.current_data["options"] if o["expiry"].date() > datetime.strptime(self.days[self.day_index], "%Y-%m-%d").date()],
+            key=lambda o: (o["expiry"], o["strike"])
+        )
         self.table.setRowCount(len(opts))
 
         for row, o in enumerate(opts):
@@ -466,7 +508,7 @@ class TradingApp(QMainWindow):
 
         for i, p in enumerate(self.portfolio):
             side       = "SHORT" if p["is_short"] else "LONG "
-            unrealized = (-1 if p["is_short"] else 1) * (p["last_price"] - p["entry_price"]) * p["quantity"]
+            unrealized = (-1 if p["is_short"] else 1) * (p["avg_price"] - p["entry_price"]) * p["quantity"]
             color      = GREEN if unrealized >= 0 else RED
             sign       = "+" if unrealized >= 0 else ""
 
@@ -475,8 +517,9 @@ class TradingApp(QMainWindow):
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(4)
 
+            tag  = " (BS)" if p.get("stale") else ""
             text = (f"{side} {p['option_type'].upper():4} K={p['strike']:.0f} "
-                    f"qty={p['quantity']} ({sign}{unrealized:.4f})")
+                    f"qty={p['quantity']} ({sign}{unrealized:.4f}){tag}")
             label = QLabel(text)
             label.setFont(QFont(MONO, 7))
             label.setStyleSheet(f"color: {color};")
