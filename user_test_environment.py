@@ -1,29 +1,46 @@
-import tkinter as tk
+import sys
+
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (
+    QApplication,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
-from envs.underlying import Underlying
 from envs.pricing import black_scholes
+from envs.underlying import Underlying
 
-BG     = "#ffffff"
-BG2    = "#f5f5f5"
+BG = "#ffffff"
+BG2 = "#f5f5f5"
 BORDER = "#dddddd"
-GREEN  = "#00aa66"
-RED    = "#dd2244"
-FG     = "#111111"
-FG2    = "#666666"
-MONO   = "Courier"
+GREEN = "#00aa66"
+RED = "#dd2244"
+FG = "#111111"
+FG2 = "#666666"
+MONO = "Courier"
 
 
-class TradingApp:
+class TradingApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RL-4-Quant // Trading Desk")
+        self.resize(1200, 820)
 
-    def __init__(self, root):
-        self.root = root
-        self.root.title("RL-4-Quant // Trading Desk")
-        self.root.configure(bg=BG)
-        self.root.geometry("1200x820")
         self.S0 = 100.0
         self.daily_vol = 0.01
         self.r = 0.0
@@ -35,142 +52,242 @@ class TradingApp:
         self.total_pnl = 0.0
         self.log = []
         self.trading_day = 0
+
         self._build_ui()
         self._new_episode()
 
     def _build_ui(self):
-        top = tk.Frame(self.root, bg=BG, pady=8)
-        top.pack(fill="x", padx=16)
-        tk.Label(top, text="RL-4-Quant // Trading Desk", bg=BG, fg=FG,
-                 font=(MONO, 15, "bold")).pack(side="left")
-        self.lbl_day  = self._metric(top, "DAY",      "0")
-        self.lbl_spot = self._metric(top, "SPOT",     "-")
-        self.lbl_vol  = self._metric(top, "REAL VOL", "-")
-        self.lbl_pnl  = self._metric(top, "P&L",      "0.00", color=GREEN)
+        root = QWidget()
+        root.setObjectName("root")
+        root.setStyleSheet(self._stylesheet())
+        self.setCentralWidget(root)
 
-        main = tk.Frame(self.root, bg=BG)
-        main.pack(fill="both", expand=True, padx=16, pady=4)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(16, 8, 16, 16)
+        root_layout.setSpacing(8)
 
-        left = tk.Frame(main, bg=BG)
-        left.pack(side="left", fill="both", expand=True)
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        title = QLabel("RL-4-Quant // Trading Desk")
+        title.setFont(QFont(MONO, 15, QFont.Bold))
+        top.addWidget(title, stretch=1)
+        self.lbl_day = self._metric(top, "DAY", "0")
+        self.lbl_spot = self._metric(top, "SPOT", "-")
+        self.lbl_vol = self._metric(top, "REAL VOL", "-")
+        self.lbl_pnl = self._metric(top, "P&L", "0.00", color=GREEN)
+        root_layout.addLayout(top)
+
+        main = QHBoxLayout()
+        main.setSpacing(12)
+        root_layout.addLayout(main, stretch=1)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
 
         self.fig = plt.Figure(figsize=(7, 5.5), facecolor=BG)
         gs = gridspec.GridSpec(2, 1, figure=self.fig, hspace=0.45, height_ratios=[2, 1])
         self.ax_price = self.fig.add_subplot(gs[0])
-        self.ax_pnl   = self.fig.add_subplot(gs[1])
-        for ax in [self.ax_price, self.ax_pnl]:
-            ax.set_facecolor(BG2)
-            ax.tick_params(colors=FG2, labelsize=7)
-            for spine in ax.spines.values():
-                spine.set_edgecolor(BORDER)
+        self.ax_pnl = self.fig.add_subplot(gs[1])
+        self._style_axes()
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=left)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left_layout.addWidget(self.canvas)
+        main.addWidget(left, stretch=1)
 
-        right = tk.Frame(main, bg=BG, width=290)
-        right.pack(side="right", fill="y", padx=(12, 0))
-        right.pack_propagate(False)
-        self._build_controls(right)
+        right = QWidget()
+        right.setFixedWidth(290)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self._build_controls(right_layout)
+        main.addWidget(right)
+
+    def _stylesheet(self):
+        return f"""
+        QWidget#root {{
+            background: {BG};
+            color: {FG};
+            font-family: {MONO};
+        }}
+        QLabel {{
+            color: {FG};
+            background: transparent;
+        }}
+        QLineEdit {{
+            background: {BG};
+            color: {FG};
+            border: 1px solid {BORDER};
+            padding: 4px 6px;
+            selection-background-color: {GREEN};
+        }}
+        QPushButton {{
+            border: none;
+            padding: 7px 8px;
+            font-weight: bold;
+        }}
+        QTextEdit {{
+            background: {BG2};
+            color: {FG2};
+            border: none;
+        }}
+        QScrollArea {{
+            border: none;
+            background: {BG2};
+        }}
+        """
 
     def _metric(self, parent, label, value, color=FG):
-        f = tk.Frame(parent, bg=BG2, padx=12, pady=6)
-        f.pack(side="right", padx=5)
-        tk.Label(f, text=label, bg=BG2, fg=FG2, font=(MONO, 7)).pack()
-        lbl = tk.Label(f, text=value, bg=BG2, fg=color, font=(MONO, 12, "bold"))
-        lbl.pack()
-        return lbl
+        frame = QFrame()
+        frame.setStyleSheet(f"background: {BG2}; border: none;")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(1)
+
+        name = QLabel(label)
+        name.setAlignment(Qt.AlignCenter)
+        name.setStyleSheet(f"color: {FG2};")
+        name.setFont(QFont(MONO, 7))
+        layout.addWidget(name)
+
+        val = QLabel(value)
+        val.setAlignment(Qt.AlignCenter)
+        val.setStyleSheet(f"color: {color};")
+        val.setFont(QFont(MONO, 12, QFont.Bold))
+        layout.addWidget(val)
+
+        parent.addWidget(frame)
+        return val
 
     def _build_controls(self, parent):
         self._sep(parent, "CONFIG")
-        cfg = tk.Frame(parent, bg=BG2, padx=8, pady=8)
-        cfg.pack(fill="x")
-        self.s0_var  = self._entry_row(cfg, "S0",       100.0)
-        self.vol_var = self._entry_row(cfg, "Daily Vol", 0.01)
-        self._btn(cfg, "New Episode", FG, self._new_episode).pack(fill="x", pady=(6, 0))
+        cfg = self._panel()
+        cfg_layout = QVBoxLayout(cfg)
+        cfg_layout.setContentsMargins(8, 8, 8, 8)
+        self.s0_var = self._entry_row(cfg_layout, "S0", 100.0)
+        self.vol_var = self._entry_row(cfg_layout, "Daily Vol", 0.01)
+        cfg_layout.addWidget(self._btn("New Episode", FG, self._new_episode))
+        parent.addWidget(cfg)
 
         self._sep(parent, "PLACE TRADE")
-        trade = tk.Frame(parent, bg=BG2, padx=8, pady=8)
-        trade.pack(fill="x")
-        self.strike_var = self._entry_row(trade, "Strike K",    100.0)
-        self.mat_var    = self._entry_row(trade, "Maturity (d)", 30,  is_int=True)
-        self.qty_var    = self._entry_row(trade, "Quantity",      1,  is_int=True)
+        trade = self._panel()
+        trade_layout = QVBoxLayout(trade)
+        trade_layout.setContentsMargins(8, 8, 8, 8)
+        self.strike_var = self._entry_row(trade_layout, "Strike K", 100.0)
+        self.mat_var = self._entry_row(trade_layout, "Maturity (d)", 30)
+        self.qty_var = self._entry_row(trade_layout, "Quantity", 1)
 
-        pf = tk.Frame(trade, bg=BG2, pady=4)
-        pf.pack(fill="x")
-        tk.Label(pf, text="CALL", bg=BG2, fg=FG2, font=(MONO, 8), width=6, anchor="w").grid(row=0, column=0)
-        self.lbl_call = tk.Label(pf, text="-", bg=BG2, fg=GREEN, font=(MONO, 10, "bold"))
-        self.lbl_call.grid(row=0, column=1, sticky="e")
-        tk.Label(pf, text="PUT",  bg=BG2, fg=FG2, font=(MONO, 8), width=6, anchor="w").grid(row=1, column=0)
-        self.lbl_put = tk.Label(pf, text="-", bg=BG2, fg=RED, font=(MONO, 10, "bold"))
-        self.lbl_put.grid(row=1, column=1, sticky="e")
-        pf.columnconfigure(1, weight=1)
+        prices = QGridLayout()
+        prices.setContentsMargins(0, 4, 0, 4)
+        prices.addWidget(self._muted_label("CALL", 8), 0, 0)
+        self.lbl_call = QLabel("-")
+        self.lbl_call.setStyleSheet(f"color: {GREEN}; font-weight: bold;")
+        prices.addWidget(self.lbl_call, 0, 1, alignment=Qt.AlignRight)
+        prices.addWidget(self._muted_label("PUT", 8), 1, 0)
+        self.lbl_put = QLabel("-")
+        self.lbl_put.setStyleSheet(f"color: {RED}; font-weight: bold;")
+        prices.addWidget(self.lbl_put, 1, 1, alignment=Qt.AlignRight)
+        trade_layout.addLayout(prices)
 
-        for var in (self.strike_var, self.mat_var):
-            var.trace_add("write", lambda *_: self._update_prices())
+        self.strike_var.textChanged.connect(self._update_prices)
+        self.mat_var.textChanged.connect(self._update_prices)
 
-        bf = tk.Frame(trade, bg=BG2)
-        bf.pack(fill="x", pady=(6, 0))
-        self._btn(bf, "BUY CALL",  GREEN, lambda: self._order("call", False)).grid(row=0, column=0, padx=2, pady=2, sticky="ew")
-        self._btn(bf, "BUY PUT",   RED,   lambda: self._order("put",  False)).grid(row=0, column=1, padx=2, pady=2, sticky="ew")
-        self._btn(bf, "SELL CALL", GREEN, lambda: self._order("call", True),  outline=True).grid(row=1, column=0, padx=2, pady=2, sticky="ew")
-        self._btn(bf, "SELL PUT",  RED,   lambda: self._order("put",  True),  outline=True).grid(row=1, column=1, padx=2, pady=2, sticky="ew")
-        bf.columnconfigure(0, weight=1)
-        bf.columnconfigure(1, weight=1)
+        buttons = QGridLayout()
+        buttons.setSpacing(4)
+        buttons.addWidget(self._btn("BUY CALL", GREEN, lambda: self._order("call", False)), 0, 0)
+        buttons.addWidget(self._btn("BUY PUT", RED, lambda: self._order("put", False)), 0, 1)
+        buttons.addWidget(self._btn("SELL CALL", GREEN, lambda: self._order("call", True), outline=True), 1, 0)
+        buttons.addWidget(self._btn("SELL PUT", RED, lambda: self._order("put", True), outline=True), 1, 1)
+        trade_layout.addLayout(buttons)
+        parent.addWidget(trade)
 
         self._sep(parent, "NAVIGATE")
-        nav = tk.Frame(parent, bg=BG2, padx=8, pady=8)
-        nav.pack(fill="x")
-        self._btn(nav, "Next Day",  FG,  self._next_day).pack(fill="x", pady=2)
-        self._btn(nav, "Skip Week", FG2, self._skip_week).pack(fill="x", pady=2)
+        nav = self._panel()
+        nav_layout = QVBoxLayout(nav)
+        nav_layout.setContentsMargins(8, 8, 8, 8)
+        nav_layout.addWidget(self._btn("Next Day", FG, self._next_day))
+        nav_layout.addWidget(self._btn("Skip Week", FG2, self._skip_week))
+        parent.addWidget(nav)
 
         self._sep(parent, "PORTFOLIO")
-        self.port_frame = tk.Frame(parent, bg=BG2)
-        self.port_frame.pack(fill="x")
+        self.port_frame = self._panel()
+        self.port_layout = QVBoxLayout(self.port_frame)
+        self.port_layout.setContentsMargins(4, 4, 4, 4)
+        self.port_layout.setSpacing(2)
+
+        portfolio_scroll = QScrollArea()
+        portfolio_scroll.setWidgetResizable(True)
+        portfolio_scroll.setFixedHeight(120)
+        portfolio_scroll.setWidget(self.port_frame)
+        parent.addWidget(portfolio_scroll)
 
         self._sep(parent, "TRADE LOG")
-        log_f = tk.Frame(parent, bg=BG2)
-        log_f.pack(fill="both", expand=True)
-        self.log_text = tk.Text(log_f, bg=BG2, fg=FG2, font=(MONO, 7),
-                                height=5, relief="flat", state="disabled")
-        self.log_text.pack(fill="both", padx=4, pady=4)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont(MONO, 7))
+        parent.addWidget(self.log_text, stretch=1)
+
+    def _panel(self):
+        panel = QFrame()
+        panel.setStyleSheet(f"background: {BG2}; border: none;")
+        return panel
+
+    def _muted_label(self, text, size=7):
+        label = QLabel(text)
+        label.setStyleSheet(f"color: {FG2};")
+        label.setFont(QFont(MONO, size))
+        return label
 
     def _sep(self, parent, title):
-        tk.Label(parent, text=title, bg=BG, fg=FG2,
-                 font=(MONO, 7), anchor="w").pack(fill="x", pady=(10, 1), padx=4)
+        label = self._muted_label(title, 7)
+        label.setContentsMargins(4, 10, 0, 1)
+        parent.addWidget(label)
 
-    def _entry_row(self, parent, label, default, is_int=False):
-        row = tk.Frame(parent, bg=BG2)
-        row.pack(fill="x", pady=2)
-        tk.Label(row, text=label, bg=BG2, fg=FG2, font=(MONO, 8),
-                 width=13, anchor="w").pack(side="left")
-        var = tk.IntVar(value=int(default)) if is_int else tk.DoubleVar(value=default)
-        tk.Entry(row, textvariable=var, bg=BG, fg=FG, insertbackground=FG,
-                 relief="flat", font=(MONO, 9), width=9).pack(side="right")
-        return var
+    def _entry_row(self, parent, label, default):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
 
-    def _btn(self, parent, text, color, cmd, outline=False):
-        bg = BG2 if outline else color
-        fg = color if outline else BG
-        return tk.Button(parent, text=text, bg=bg, fg=fg, relief="flat",
-                         font=(MONO, 8, "bold"), cursor="hand2",
-                         activebackground=color, activeforeground=BG,
-                         command=cmd)
+        name = self._muted_label(label, 8)
+        name.setFixedWidth(120)
+        row.addWidget(name)
+
+        entry = QLineEdit(str(default))
+        entry.setFont(QFont(MONO, 9))
+        entry.setAlignment(Qt.AlignRight)
+        row.addWidget(entry)
+
+        parent.addLayout(row)
+        return entry
+
+    def _btn(self, text, color, cmd, outline=False):
+        button = QPushButton(text)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFont(QFont(MONO, 8, QFont.Bold))
+        if outline:
+            button.setStyleSheet(
+                f"background: {BG2}; color: {color}; border: 1px solid {color};"
+            )
+        else:
+            button.setStyleSheet(f"background: {color}; color: {BG};")
+        button.clicked.connect(cmd)
+        return button
 
     def _new_episode(self):
         try:
-            self.S0        = float(self.s0_var.get())
-            self.daily_vol = float(self.vol_var.get())
-        except Exception:
+            self.S0 = float(self.s0_var.text())
+            self.daily_vol = float(self.vol_var.text())
+        except ValueError:
             pass
         self.underlying = Underlying(S0=self.S0, daily_vol=self.daily_vol)
         self.underlying.simulate(251)
         self.history_prices = list(self.underlying.prices)
         self.live_prices = [self.history_prices[-1]]
         self.trading_day = 0
-        self.portfolio   = []
+        self.portfolio = []
         self.pnl_history = [0.0]
-        self.total_pnl   = 0.0
-        self.log         = []
+        self.total_pnl = 0.0
+        self.log = []
         self._refresh()
 
     def _current_price(self):
@@ -188,55 +305,39 @@ class TradingApp:
 
     def _order(self, option_type, is_short):
         try:
-            K   = float(self.strike_var.get())
-            mat = int(self.mat_var.get())
-            qty = int(self.qty_var.get())
-        except Exception:
+            K = float(self.strike_var.text())
+            mat = int(self.mat_var.text())
+            qty = int(self.qty_var.text())
+        except ValueError:
             return
         if qty <= 0 or mat <= 0:
             return
-        S     = self._current_price()
+
+        S = self._current_price()
         sigma = self._realized_vol()
-        T     = mat / 252
+        T = mat / 252
         price = black_scholes(S=S, K=K, T=T, r=self.r, sigma=sigma, option_type=option_type)
         direction = "SELL" if is_short else "BUY "
-        self.portfolio.append({
-            "option_type": option_type,
-            "strike":      K,
-            "maturite":    mat,
-            "quantite":    qty,
-            "is_short":    is_short,
-            "entry_day":   self.trading_day,
-            "entry_price": price,
-            "last_price":  price,
-        })
-        # broker fees: 0.65 per contract
+        self.portfolio.append(
+            {
+                "option_type": option_type,
+                "strike": K,
+                "maturite": mat,
+                "quantite": qty,
+                "is_short": is_short,
+                "entry_day": self.trading_day,
+                "entry_price": price,
+                "last_price": price,
+            }
+        )
+
         fees = 0.65 * qty
         self.total_pnl -= fees
         self.pnl_history[-1] = self.total_pnl
-
         self.log.append(
-            "Day %3d | %s %4s K=%.1f T=%dd qty=%d @ %.4f  fees=-%.2f" % (
-                self.trading_day, direction, option_type.upper(), K, mat, qty, price, fees)
+            "Day %3d | %s %4s K=%.1f T=%dd qty=%d @ %.4f  fees=-%.2f"
+            % (self.trading_day, direction, option_type.upper(), K, mat, qty, price, fees)
         )
-        self._refresh()
-
-    def _close_position(self, idx):
-        p     = self.portfolio[idx]
-        price = p["last_price"]
-        direction = -1 if p["is_short"] else 1
-        # realize the unrealized P&L immediately
-        realized = direction * (price - p["entry_price"]) * p["quantite"]
-        # broker fees on close too
-        fees = 0.65 * p["quantite"]
-        self.total_pnl -= fees
-        self.pnl_history[-1] = self.total_pnl
-
-        self.log.append(
-            "Day %3d | CLOSE %4s K=%.1f @ %.4f  P&L=%.2f  fees=-%.2f" % (
-                self.trading_day, p["option_type"].upper(), p["strike"], price, realized, fees)
-        )
-        self.portfolio.pop(idx)
         self._refresh()
 
     def _next_day(self):
@@ -249,13 +350,13 @@ class TradingApp:
         self._refresh()
 
     def _advance(self):
-        S     = self.live_prices[-1]
-        Z     = np.random.standard_normal()
-        S_new = S * np.exp(-0.5 * self.daily_vol ** 2 + self.daily_vol * Z)
+        S = self.live_prices[-1]
+        Z = np.random.standard_normal()
+        S_new = S * np.exp(-0.5 * self.daily_vol**2 + self.daily_vol * Z)
         self.live_prices.append(S_new)
         self.trading_day += 1
         self._check_early_exercise()
-        self.total_pnl   += self._mark_to_market()
+        self.total_pnl += self._mark_to_market()
         self.pnl_history.append(self.total_pnl)
 
     def _check_early_exercise(self):
@@ -265,42 +366,51 @@ class TradingApp:
             if not p["is_short"]:
                 continue
             if p["option_type"] == "call" and S > p["strike"]:
-                # call exerced: we lose (S - K) * qty, minus what we already lost via mtm
                 payoff = (S - p["strike"]) * p["quantite"]
-                loss   = -payoff - (-p["last_price"] * p["quantite"])  # net vs last mtm
+                loss = -payoff - (-p["last_price"] * p["quantite"])
                 self.total_pnl += loss
                 self.log.append(
-                    f"Day {self.trading_day:>3} | EXERCISED CALL K={p['strike']:.1f} S={S:.2f}  loss={(loss):+.4f}"
+                    f"Day {self.trading_day:>3} | EXERCISED CALL K={p['strike']:.1f} "
+                    f"S={S:.2f}  loss={loss:+.4f}"
                 )
                 p["expired"] = True
             elif p["option_type"] == "put" and S < p["strike"]:
-                # put exerced: we lose (K - S) * qty
                 payoff = (p["strike"] - S) * p["quantite"]
-                loss   = -payoff - (-p["last_price"] * p["quantite"])
+                loss = -payoff - (-p["last_price"] * p["quantite"])
                 self.total_pnl += loss
                 self.log.append(
-                    f"Day {self.trading_day:>3} | EXERCISED PUT  K={p['strike']:.1f} S={S:.2f}  loss={(loss):+.4f}"
+                    f"Day {self.trading_day:>3} | EXERCISED PUT  K={p['strike']:.1f} "
+                    f"S={S:.2f}  loss={loss:+.4f}"
                 )
                 p["expired"] = True
         self.portfolio = [p for p in self.portfolio if not p.get("expired")]
 
     def _mark_to_market(self):
-        S     = self._current_price()
+        S = self._current_price()
         sigma = self._realized_vol()
-        t     = self.trading_day
+        t = self.trading_day
         daily_pnl = 0.0
         for p in self.portfolio:
             days_left = p["entry_day"] + p["maturite"] - t
             if days_left <= 0:
-                payoff = max(S - p["strike"], 0.0) if p["option_type"] == "call" else max(p["strike"] - S, 0.0)
+                if p["option_type"] == "call":
+                    payoff = max(S - p["strike"], 0.0)
+                else:
+                    payoff = max(p["strike"] - S, 0.0)
                 direction = -1 if p["is_short"] else 1
                 daily_pnl += direction * (payoff - p["last_price"]) * p["quantite"]
                 p["last_price"] = payoff
-                p["expired"]    = True
+                p["expired"] = True
             else:
-                T         = days_left / 252
-                new_price = black_scholes(S=S, K=p["strike"], T=T, r=self.r,
-                                          sigma=sigma, option_type=p["option_type"])
+                T = days_left / 252
+                new_price = black_scholes(
+                    S=S,
+                    K=p["strike"],
+                    T=T,
+                    r=self.r,
+                    sigma=sigma,
+                    option_type=p["option_type"],
+                )
                 direction = -1 if p["is_short"] else 1
                 daily_pnl += direction * (new_price - p["last_price"]) * p["quantite"]
                 p["last_price"] = new_price
@@ -310,13 +420,15 @@ class TradingApp:
     def _close_position(self, idx):
         if idx >= len(self.portfolio):
             return
-        p         = self.portfolio[idx]
+        p = self.portfolio[idx]
         direction = "SELL" if p["is_short"] else "BUY "
-        # realize P&L at current market price (last_price already up to date)
-        realized  = (-1 if p["is_short"] else 1) * (p["last_price"] - p["entry_price"]) * p["quantite"]
+        realized = (-1 if p["is_short"] else 1) * (
+            p["last_price"] - p["entry_price"]
+        ) * p["quantite"]
         self.log.append(
-            f"Day {self.trading_day:>3} | CLOSE {direction.strip()} {p['option_type'].upper():4} "
-            f"K={p['strike']:.1f} @ {p['last_price']:.4f}  PnL={realized:+.4f}"
+            f"Day {self.trading_day:>3} | CLOSE {direction.strip()} "
+            f"{p['option_type'].upper():4} K={p['strike']:.1f} "
+            f"@ {p['last_price']:.4f}  PnL={realized:+.4f}"
         )
         self.portfolio.pop(idx)
         self._refresh()
@@ -325,90 +437,114 @@ class TradingApp:
         if not self.live_prices:
             return
         try:
-            K   = float(self.strike_var.get())
-            mat = max(int(self.mat_var.get()), 1)
-        except Exception:
+            K = float(self.strike_var.text())
+            mat = max(int(self.mat_var.text()), 1)
+        except ValueError:
             return
-        S     = self._current_price()
+        S = self._current_price()
         sigma = self._realized_vol()
-        T     = mat / 252
+        T = mat / 252
         call_p = black_scholes(S=S, K=K, T=T, r=self.r, sigma=sigma, option_type="call")
-        put_p  = black_scholes(S=S, K=K, T=T, r=self.r, sigma=sigma, option_type="put")
-        self.lbl_call.config(text="%.4f" % call_p)
-        self.lbl_put.config(text="%.4f" % put_p)
+        put_p = black_scholes(S=S, K=K, T=T, r=self.r, sigma=sigma, option_type="put")
+        self.lbl_call.setText(f"{call_p:.4f}")
+        self.lbl_put.setText(f"{put_p:.4f}")
 
     def _refresh(self):
-        S     = self._current_price()
+        S = self._current_price()
         sigma = self._realized_vol()
-        pnl   = self.total_pnl
+        pnl = self.total_pnl
 
-        self.lbl_day.config(text=str(self.trading_day))
-        self.lbl_spot.config(text="%.2f" % S)
-        self.lbl_vol.config(text="%.1f%%" % (sigma * 100))
-        self.lbl_pnl.config(text="%+.2f" % pnl, fg=GREEN if pnl >= 0 else RED)
+        self.lbl_day.setText(str(self.trading_day))
+        self.lbl_spot.setText(f"{S:.2f}")
+        self.lbl_vol.setText(f"{sigma * 100:.1f}%")
+        self.lbl_pnl.setText(f"{pnl:+.2f}")
+        self.lbl_pnl.setStyleSheet(f"color: {GREEN if pnl >= 0 else RED};")
 
-        all_p  = self._all_prices()
+        all_p = self._all_prices()
         n_hist = len(self.history_prices)
         n_total = len(all_p)
 
         self.ax_price.cla()
         self.ax_pnl.cla()
+        self._style_axes()
+
+        self.ax_price.plot(range(n_hist), self.history_prices, color=BORDER, lw=1.5)
+        if len(self.live_prices) > 1:
+            live_x = list(range(n_hist - 1, n_total))
+            self.ax_price.plot(
+                live_x,
+                [self.history_prices[-1]] + self.live_prices[1:],
+                color=GREEN,
+                lw=1.5,
+            )
+        self.ax_price.axvline(x=n_hist - 1, color=BORDER, lw=1, ls="--")
+        self.ax_price.set_title("grey = history   green = trading", color=FG2, fontsize=8, pad=3)
+
+        fill_color = GREEN if self.pnl_history[-1] >= 0 else RED
+        self.ax_pnl.plot(self.pnl_history, color=fill_color, lw=1.5)
+        self.ax_pnl.fill_between(
+            range(len(self.pnl_history)), self.pnl_history, alpha=0.15, color=fill_color
+        )
+        self.ax_pnl.axhline(0, color=BORDER, lw=0.8)
+        self.ax_pnl.set_title("P&L", color=FG2, fontsize=8, pad=3)
+        self.canvas.draw()
+
+        self._refresh_portfolio()
+        self.log_text.setPlainText("\n".join(reversed(self.log[-30:])))
+        self._update_prices()
+
+    def _style_axes(self):
         for ax in [self.ax_price, self.ax_pnl]:
             ax.set_facecolor(BG2)
             ax.tick_params(colors=FG2, labelsize=7)
             for spine in ax.spines.values():
                 spine.set_edgecolor(BORDER)
 
-        self.ax_price.plot(range(n_hist), self.history_prices, color=BORDER, lw=1.5)
-        if len(self.live_prices) > 1:
-            live_x = list(range(n_hist - 1, n_total))
-            self.ax_price.plot(live_x, [self.history_prices[-1]] + self.live_prices[1:],
-                               color=GREEN, lw=1.5)
-        self.ax_price.axvline(x=n_hist - 1, color=BORDER, lw=1, ls="--")
-        self.ax_price.set_title("grey = history   green = trading", color=FG2, fontsize=8, pad=3)
+    def _refresh_portfolio(self):
+        while self.port_layout.count():
+            item = self.port_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
-        pnl_hist   = self.pnl_history
-        fill_color = GREEN if pnl_hist[-1] >= 0 else RED
-        self.ax_pnl.plot(pnl_hist, color=fill_color, lw=1.5)
-        self.ax_pnl.fill_between(range(len(pnl_hist)), pnl_hist, alpha=0.15, color=fill_color)
-        self.ax_pnl.axhline(0, color=BORDER, lw=0.8)
-        self.ax_pnl.set_title("P&L", color=FG2, fontsize=8, pad=3)
-
-        self.canvas.draw()
-
-        # portfolio: one row per position with a CLOSE button
-        for w in self.port_frame.winfo_children():
-            w.destroy()
         if not self.portfolio:
-            tk.Label(self.port_frame, text="No open positions.", bg=BG2, fg=FG2,
-                     font=(MONO, 8)).pack(anchor="w", padx=4, pady=4)
-        else:
-            for i, p in enumerate(self.portfolio):
-                days_to_exp = p["entry_day"] + p["maturite"] - self.trading_day
-                direction   = "SELL" if p["is_short"] else "BUY "
-                unrealized  = (-1 if p["is_short"] else 1) * (p["last_price"] - p["entry_price"]) * p["quantite"]
-                color       = GREEN if unrealized >= 0 else RED
-                sign        = "+" if unrealized >= 0 else ""
-                row = tk.Frame(self.port_frame, bg=BG2)
-                row.pack(fill="x", padx=4, pady=1)
-                tk.Label(row,
-                         text="%s %4s K=%.1f T=%dd (%s%.2f)" % (
-                             direction, p["option_type"].upper(), p["strike"], days_to_exp, sign, unrealized),
-                         bg=BG2, fg=color, font=(MONO, 7), anchor="w").pack(side="left")
-                tk.Button(row, text="CLOSE", bg=BG2, fg=RED, font=(MONO, 7, "bold"),
-                          relief="flat", cursor="hand2",
-                          command=lambda idx=i: self._close_position(idx)).pack(side="right")
+            empty = self._muted_label("No open positions.", 8)
+            self.port_layout.addWidget(empty)
+            self.port_layout.addStretch(1)
+            return
 
-        self.log_text.config(state="normal")
-        self.log_text.delete("1.0", "end")
-        for entry in reversed(self.log[-30:]):
-            self.log_text.insert("end", entry + "\n")
-        self.log_text.config(state="disabled")
+        for i, p in enumerate(self.portfolio):
+            days_to_exp = p["entry_day"] + p["maturite"] - self.trading_day
+            direction = "SELL" if p["is_short"] else "BUY "
+            unrealized = (-1 if p["is_short"] else 1) * (
+                p["last_price"] - p["entry_price"]
+            ) * p["quantite"]
+            color = GREEN if unrealized >= 0 else RED
+            sign = "+" if unrealized >= 0 else ""
 
-        self._update_prices()
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+
+            label = QLabel(
+                "%s %4s K=%.1f T=%dd (%s%.2f)"
+                % (direction, p["option_type"].upper(), p["strike"], days_to_exp, sign, unrealized)
+            )
+            label.setFont(QFont(MONO, 7))
+            label.setStyleSheet(f"color: {color};")
+            row_layout.addWidget(label, stretch=1)
+
+            close = self._btn("CLOSE", RED, lambda _, idx=i: self._close_position(idx), outline=True)
+            close.setFont(QFont(MONO, 7, QFont.Bold))
+            row_layout.addWidget(close)
+            self.port_layout.addWidget(row)
+
+        self.port_layout.addStretch(1)
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    TradingApp(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = TradingApp()
+    window.show()
+    sys.exit(app.exec_())

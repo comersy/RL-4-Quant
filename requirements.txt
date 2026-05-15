@@ -2,3 +2,4 @@ numpy
 gymnasium
 matplotlib
 scipy
+PyQt5
