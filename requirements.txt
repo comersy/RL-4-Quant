@@ -3,3 +3,6 @@ gymnasium
 matplotlib
 scipy
 PyQt5
+time
+requests
+datetime
