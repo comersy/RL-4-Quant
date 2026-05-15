@@ -68,7 +68,8 @@ def save_day(date: datetime, trades: list[dict]):
 
     # trades.csv
     if trades:
-        fieldnames = list(trades[0].keys())
+        # collect all possible fieldnames across all trades
+        fieldnames = sorted({k for t in trades for k in t.keys()})
         with open(os.path.join(day_dir, 'trades.csv'), 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
