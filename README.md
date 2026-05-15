@@ -1,4 +1,4 @@
-# RL-4-Quant 📈
+# RL-4-Quant 
 
 > A Reinforcement Learning agent that learns to trade options — calls and puts — on a simulated (then real) underlying asset, purely from market signals. No predefined rules. No hardcoded strategies. Just an agent that learns to profit.
 
