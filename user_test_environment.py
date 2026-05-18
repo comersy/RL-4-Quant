@@ -29,7 +29,6 @@ from PyQt5.QtWidgets import (
 )
 
 from data.loader import list_available_days, load_day
-from datetime import datetime
 
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
@@ -116,9 +115,9 @@ class TradingApp(QMainWindow):
         # options table
         self._sep_above(left_layout, "OPTIONS OF THE DAY")
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels(
-            ["Type", "Strike", "Expiry", "Last (BTC)", "Avg (BTC)", "IV %", "Volume", "Qty", "Action"]
+            ["Type", "Strike", "Expiry", "Price (BTC)", "IV %", "Volume", "Qty", "Action"]
         )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
@@ -147,6 +146,7 @@ class TradingApp(QMainWindow):
         nav_layout = QVBoxLayout(nav)
         nav_layout.setContentsMargins(8, 8, 8, 8)
         nav_layout.addWidget(self._btn("▶  Next Day",  FG,   self._next_day))
+        nav_layout.addWidget(self._btn("⏮  Prev Day",  FG2,  self._prev_day))
         nav_layout.addWidget(self._btn("↺  Restart",   FG2,  self._restart))
         parent.addWidget(nav)
 
@@ -320,7 +320,7 @@ class TradingApp(QMainWindow):
     def _order(self, opt: dict, qty: int, side: str):
         if qty <= 0:
             return
-        price = opt["avg_price"]
+        price = opt["price"]
         if side == "BUY":
             self.realized_pnl -= price * qty           # pay the premium
         else:
@@ -331,11 +331,9 @@ class TradingApp(QMainWindow):
             "quantity":    qty,
             "is_short":    side == "SELL",
             "entry_price": price,
-            "avg_price":  price,
+            "price":  price,
             "entry_date":  self.days[self.day_index],
         })
-        self.portfolio[-1]["iv_last"] = opt["iv"] if opt["iv"] > 0 else 0.5
-        self.portfolio[-1]["stale"]   = False
         self.log.append(
             f"{self.days[self.day_index]} | {side:4} {opt['option_type'].upper():4} "
             f"K={opt['strike']:.0f} {opt['expiry'].strftime('%d%b%y')} qty={qty} "
@@ -348,7 +346,7 @@ class TradingApp(QMainWindow):
         if idx >= len(self.portfolio):
             return
         p     = self.portfolio[idx]
-        price = p["avg_price"]
+        price = p["price"]
         # close = reverse trade at current market price
         if p["is_short"]:
             self.realized_pnl -= price * p["quantity"]    # buy back
@@ -364,52 +362,15 @@ class TradingApp(QMainWindow):
         self._refresh()
 
     def _mark_to_market(self):
-        """Update price of open positions using today's data, handle expirations, recompute unrealized P&L."""
-        from envs.pricing import black_scholes
-        from datetime import datetime
-
+        """Update price of open positions using today's data, recompute unrealized P&L."""
         opts_by_instr = {o["instrument"]: o for o in self.current_data["options"]}
-        spot          = self.current_data["spot"]
-        day_today     = datetime.strptime(self.days[self.day_index], "%Y-%m-%d")
-        unrealized    = 0.0
-
+        unrealized = 0.0
         for p in self.portfolio:
-            # 1. Expiration check
-            if p["expiry"] <= day_today:
-                payoff_usd = (max(spot - p["strike"], 0.0) if p["option_type"] == "call"
-                            else max(p["strike"] - spot, 0.0))
-                payoff_btc = payoff_usd / spot
-                sign       = -1 if p["is_short"] else 1
-                # realized: receive payoff (long) or pay it (short)
-                self.realized_pnl += sign * payoff_btc * p["quantity"]
-                self.log.append(
-                    f"{self.days[self.day_index]} | EXPIRED {p['option_type'].upper():4} "
-                    f"K={p['strike']:.0f} payoff={payoff_btc:.4f} BTC qty={p['quantity']}"
-                )
-                p["expired"] = True
-                continue
-
-            # 2. Mark to market with today's price or Black-Scholes fallback
             o = opts_by_instr.get(p["instrument"])
             if o is not None:
-                p["avg_price"] = o["avg_price"]
-                p["iv_last"]   = o["iv"] if o["iv"] > 0 else p.get("iv_last", 50.0)
-                p["stale"]     = False
-            else:
-                days_left = (p["expiry"] - day_today).days
-                T         = max(days_left, 1) / 365
-                sigma     = p.get("iv_last", 50.0) / 100
-                price_usd = black_scholes(S=spot, K=p["strike"], T=T, r=0.0,
-                                        sigma=sigma, option_type=p["option_type"])
-                p["avg_price"] = price_usd / spot
-                p["stale"]     = True
-
-            # 3. Unrealized P&L
-            sign        = -1 if p["is_short"] else 1
-            unrealized += sign * (p["avg_price"] - p["entry_price"]) * p["quantity"]
-
-        # remove expired positions
-        self.portfolio      = [p for p in self.portfolio if not p.get("expired")]
+                p["price"] = o["price"]
+            sign = -1 if p["is_short"] else 1
+            unrealized += sign * (p["price"] - p["entry_price"]) * p["quantity"]
         self.unrealized_pnl = unrealized
 
     # ── Refresh UI ────────────────────────────────────────────────────────────
@@ -443,20 +404,16 @@ class TradingApp(QMainWindow):
         self.canvas.draw()
 
     def _fill_options_table(self):
-        opts = sorted(
-            [o for o in self.current_data["options"] if o["expiry"].date() > datetime.strptime(self.days[self.day_index], "%Y-%m-%d").date()],
-            key=lambda o: (o["expiry"], o["strike"])
-        )
+        opts = sorted(self.current_data["options"], key=lambda o: (o["expiry"], o["strike"]))
         self.table.setRowCount(len(opts))
 
         for row, o in enumerate(opts):
             self.table.setItem(row, 0, QTableWidgetItem(o["option_type"].upper()))
             self.table.setItem(row, 1, QTableWidgetItem(f"{o['strike']:.0f}"))
             self.table.setItem(row, 2, QTableWidgetItem(o["expiry"].strftime("%d %b %y")))
-            self.table.setItem(row, 3, QTableWidgetItem(f"{o['last_price']:.4f}"))
-            self.table.setItem(row, 4, QTableWidgetItem(f"{o['avg_price']:.4f}"))
-            self.table.setItem(row, 5, QTableWidgetItem(f"{o['iv']:.1f}"))
-            self.table.setItem(row, 6, QTableWidgetItem(f"{o['volume']:.1f}"))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{o['price']:.4f}"))
+            self.table.setItem(row, 4, QTableWidgetItem(f"{o['iv']:.1f}"))
+            self.table.setItem(row, 5, QTableWidgetItem(f"{o['volume']:.1f}"))
 
             # color call/put cell
             color = GREEN if o["option_type"] == "call" else RED
@@ -467,7 +424,7 @@ class TradingApp(QMainWindow):
             qty_edit.setFixedWidth(40)
             qty_edit.setAlignment(Qt.AlignRight)
             qty_edit.setFont(QFont(MONO, 9))
-            self.table.setCellWidget(row, 7, qty_edit)
+            self.table.setCellWidget(row, 6, qty_edit)
 
             # action buttons in last column
             action = QWidget()
@@ -483,7 +440,7 @@ class TradingApp(QMainWindow):
                 h.addWidget(b)
             buy.clicked.connect (lambda _, o=o, e=qty_edit: self._order(o, self._safe_int(e), "BUY"))
             sell.clicked.connect(lambda _, o=o, e=qty_edit: self._order(o, self._safe_int(e), "SELL"))
-            self.table.setCellWidget(row, 8, action)
+            self.table.setCellWidget(row, 7, action)
 
     def _safe_int(self, edit):
         try:
@@ -508,7 +465,7 @@ class TradingApp(QMainWindow):
 
         for i, p in enumerate(self.portfolio):
             side       = "SHORT" if p["is_short"] else "LONG "
-            unrealized = (-1 if p["is_short"] else 1) * (p["avg_price"] - p["entry_price"]) * p["quantity"]
+            unrealized = (-1 if p["is_short"] else 1) * (p["price"] - p["entry_price"]) * p["quantity"]
             color      = GREEN if unrealized >= 0 else RED
             sign       = "+" if unrealized >= 0 else ""
 
@@ -517,9 +474,8 @@ class TradingApp(QMainWindow):
             h.setContentsMargins(0, 0, 0, 0)
             h.setSpacing(4)
 
-            tag  = " (BS)" if p.get("stale") else ""
             text = (f"{side} {p['option_type'].upper():4} K={p['strike']:.0f} "
-                    f"qty={p['quantity']} ({sign}{unrealized:.4f}){tag}")
+                    f"qty={p['quantity']} ({sign}{unrealized:.4f})")
             label = QLabel(text)
             label.setFont(QFont(MONO, 7))
             label.setStyleSheet(f"color: {color};")
