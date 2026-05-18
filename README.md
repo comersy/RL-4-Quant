@@ -13,9 +13,9 @@
   - [Action Space](#action-space)
   - [Observation Space](#observation-space)
   - [Reward Function](#reward-function)
-- [Algorithm — LSTM-SAC](#algorithm--lstm-sac)
+- [Algorithm — GRU-SAC](#algorithm--gru-sac)
   - [Why SAC](#why-sac)
-  - [Why LSTM](#why-lstm)
+  - [Why GRU](#why-gru)
   - [Full Architecture](#full-architecture)
 - [Roadmap — Progressive Phases](#roadmap--progressive-phases)
   - [Phase 1 — Baseline (Simulated, Minimal Obs)](#phase-1--baseline-simulated-minimal-obs)
@@ -65,16 +65,18 @@ At the start of each episode, the full price path for the year is pre-simulated.
 
 ### Action Space
 
-At each timestep, the agent outputs a **continuous action vector** that is discretized before being sent to the environment:
+At each timestep, the agent outputs a **hierarchical action space**:
 
 | Parameter | Type | Range |
 |-----------|------|-------|
-| `action_type` | Continuous → discretized | 0 = nothing, 1 = buy call, 2 = buy put, 3 = sell call, 4 = sell put |
+| **Primary decision** | Discrete (0-2) | 0 = do nothing, 1 = trade, 2 = close positions |
+| **IF action_type = 1 (trade):** | | |
+| `call_or_put` | Continuous → [0, 1] | 0 = call, 1 = put |
 | `strike` | Continuous | Unbounded (relative to current spot, e.g. moneyness) |
-| `maturity` | Continuous → discretized | 1 to T_remaining (days) |
-| `quantity` | Continuous → discretized integer | 1 to N_max |
+| `maturity` | Discrete | [1, T_remaining] (days) |
+| `quantity_signed` | Continuous | Unbounded; **positive = long/buy, negative = short/sell** |
 
-SAC outputs all four values as continuous numbers. Post-processing handles discretization (argmax for type, rounding for maturity and quantity) before the environment receives the action. This preserves the benefits of continuous action optimization while respecting the discrete nature of certain parameters.
+This design is **cleaner than separating buy/sell**: the sign of `quantity_signed` directly encodes both the direction and magnitude, reducing redundancy and letting the agent learn to use leverage naturally.
 
 ### Observation Space
 
@@ -133,7 +135,7 @@ R_total = R_pnl                          # main signal: quarterly P&L
 
 ---
 
-## Algorithm — LSTM-SAC
+## Algorithm — GRU-SAC
 
 ### Why SAC
 
@@ -144,7 +146,7 @@ R_total = R_pnl                          # main signal: quarterly P&L
 - **Sample efficiency**: far more sample-efficient than PPO on continuous spaces — important when each episode is 252 steps and training is expensive
 - **Stability**: SAC's twin critic architecture and temperature-tuned entropy make it significantly more stable than DDPG on noisy financial environments
 
-### Why LSTM
+### Why GRU with Learned Decay
 
 A memoryless agent sees only the current state of the market. It cannot:
 - Remember positions it opened 30 days ago
@@ -152,46 +154,134 @@ A memoryless agent sees only the current state of the market. It cannot:
 - Build multi-leg strategies over time (e.g. sell a call now, buy a put in 2 weeks)
 - Track the evolution of its own P&L trajectory
 
-The **LSTM hidden state `h_t`** encodes the agent's full memory since the start of the episode. At each step, `h_t` is updated with the new observation and passed to both the Actor and the Critic. This gives the agent a recurrent memory of:
-- Its own action history
-- The sequence of P&L realizations
-- The price path it has lived through
-- Its current open positions and their aging
+The **GRU hidden state `h_t`** encodes the agent's full memory since the start of the episode. Compared to LSTM, GRU is more computationally efficient while retaining the ability to capture long-term dependencies.
 
-Since the reward is **sparse and quarterly**, recurrent memory is not optional — it is essential for the agent to connect its current decisions to their future consequences.
+**Key innovation: Learned Decay Network**
+
+Instead of a fixed GRU with constant gating, the agent learns **how much to remember** at each timestep via a **decay network**:
+
+$$\\alpha_t = \\sigma(\\text{DecayNet}([h_{t-1}, s_t]))$$
+
+Where:
+- `h_{t-1}` → previous GRU hidden state (accumulated memory)
+- `s_t` → current market/portfolio state (observation)
+- `α_t` ∈ [0, 1] → adaptive forget factor
+  - α_t ≈ 1 → preserve memory (stable market, holding long-term positions)
+  - α_t ≈ 0 → reset memory (regime shift, liquidation event)
+
+**Decay Network Architecture** (implemented inside `GRUCell`):
+
+```
+Input: [h_{t-1}, s_t]  (size: gru_hidden_size + obs_dim)
+       ↓
+MLP Layer 1: Linear(hidden + obs_dim → 128) + ReLU
+       ↓
+MLP Layer 2: Linear(128 → 64) + ReLU
+       ↓
+Output Layer: Linear(64 → 1)
+       ↓
+Sigmoid  →  α_t ∈ [0, 1]
+```
+
+Then the decay is applied to the GRU hidden state:
+
+$$h_t = \\alpha_t \\odot h_\\text{raw} + (1 - \\alpha_t) \\odot h_{t-1}$$
+
+This is a **learned blend** between the new GRU state and previous memory. The network trains end-to-end with PPO: when the policy gradient improves, so does decay.
+
+**Benefit**: The GRU becomes **context-aware**. When volatility spikes or the market regime changes, the decay network can reduce α_t and let old memories fade. When in a trend, it keeps α_t high. This is far more expressive than a fixed GRU.
+
+Since the reward is **sparse and quarterly**, recurrent memory with learned adaptive decay is essential for connecting multi-step decisions to delayed consequences.
 
 ### Full Architecture
 
 ```
+╔════════════════════════════════════════════════════════════════════════════╗
+║                      GRU-PPO with Learned Decay Memory                     ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
 Observation (t)
       │
       ▼
-┌─────────────┐
-│ FC Encoder  │   Linear layers — normalizes and projects raw obs
-│ [256 → 128] │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│    LSTM     │   Recurrent layer — full episode memory
-│ hidden=256  │   h_t, c_t = LSTM(encoded_obs_t, h_{t-1}, c_{t-1})
-└──────┬──────┘
-       │  h_t
-       ├────────────────────────┐
-       ▼                        ▼
-┌─────────────┐        ┌─────────────────┐
-│    Actor    │        │  Twin Critics   │   Q₁(s,a) and Q₂(s,a)
-│ [128 → 64]  │        │  [128 → 64]     │   min(Q₁, Q₂) → anti-overestimation
-│ outputs:    │        └─────────────────┘
-│ μ, σ → a   │
-│ [type, K,  │
-│  T, qty]   │
-└─────────────┘
+┌──────────────────────────┐
+│    FC Encoder            │   Raw obs → latent representation
+│  [obs_dim → 256 → 128]   │   Normalizes and projects observation
+└────────────┬─────────────┘
+             │ encoded_t
+             ▼
+    ╔════════════════════════════════════════════════════════════════╗
+    ║          GRU Cell with Learned Adaptive Decay                  ║
+    ║                                                                ║
+    ║  1. Standard GRU:                                             ║
+    ║     h_raw = GRU_cell(encoded_t, h_{t-1})                      ║
+    ║                                                                ║
+    ║  2. Decay Network (MLP):                                      ║
+    ║     decay_input = concat([h_{t-1}, encoded_t])                ║
+    ║     α_t = σ(MLP_decay(decay_input))    ← learns when to forget║
+    ║                                                                ║
+    ║  3. Adaptive Blend:                                           ║
+    ║     h_t = α_t ⊙ h_raw + (1 - α_t) ⊙ h_{t-1}                 ║
+    ║     │         └─ new state  │         └─ preserve memory      ║
+    ║                                                                ║
+    ╚════════════════════════════════════════════════════════════════╝
+             │ h_t (context-aware memory)
+             │
+             ├─────────────────────────────┬─────────────────────────┐
+             ▼                             ▼                         ▼
+    ┌──────────────────┐        ┌──────────────────┐    ┌──────────────────┐
+    │      Actor       │        │   Critic (V)     │    │ (For monitoring) │
+    │   [256 → 128]    │        │  [256 → 128]     │    │  alpha ∈ [0, 1] │
+    │                  │        │                  │    └──────────────────┘
+    │  Outputs:        │        │  Outputs:        │
+    │  • action_type   │        │  • state_value   │
+    │    (3 logits)    │        │                  │
+    │  • call_or_put   │        │  Uses: MSE loss  │
+    │    (Normal)      │        │  with returns    │
+    │  • strike        │        │                  │
+    │    (Normal)      │        │                  │
+    │  • maturity      │        │                  │
+    │    (Categorical) │        │                  │
+    │  • quantity_     │        │                  │
+    │    signed        │        │                  │
+    │    (Normal)      │        │                  │
+    │                  │        │                  │
+    │ PPO Loss:        │        │                  │
+    │ -min(r·adv,      │        │                  │
+    │  clip·adv)       │        │                  │
+    └──────────────────┘        └──────────────────┘
+             │                          │
+             └──────────┬───────────────┘
+                        ▼
+              ╔═══════════════════════════════╗
+              ║  Gradient flows back through  ║
+              ║  ENTIRE network including     ║
+              ║  decay network (α_t)          ║
+              ╚═══════════════════════════════╝
 ```
 
-**LSTM mode**: full recurrent (Option B) — `h_{t-1}` is passed at every step so the hidden state accumulates information from the very start of the episode. This is necessary given the sparse quarterly reward.
+**Key Components:**
 
-**Replay buffer**: stores full episode sequences, not individual transitions. LSTM training requires sequential context — sampling random transitions would break the temporal structure and corrupt the hidden state.
+1. **FC Encoder** → Projects raw observation to latent space
+2. **GRU Cell with Decay Network** → The core innovation
+   - Standard `GRUCell` produces `h_raw`
+   - **Decay MLP** learns context-dependent forget factor `α_t`
+   - **Adaptive blend** mixes new information with old memory
+3. **Actor** → Outputs hierarchical actions with learnable log_probs
+4. **Critic** → Estimates value for advantage calculation
+5. **Decay Regularization** → Prevents α_t from collapsing
+
+**Data Flow:**
+- Observation → Encoder → [h_prev, encoded] → Decay MLP → α_t
+- GRUCell(encoded, h_prev) → h_raw
+- h_new = α_t × h_raw + (1-α_t) × h_prev → Actor/Critic → Actions & Values
+
+**Training:**
+- PPO clipping on policy gradients
+- MSE on value function
+- Decay entropy regularization (optional but recommended)
+- Full backprop through decay network — it learns end-to-end!
+
+**Hierarchical action structure**: The actor first predicts the primary action (do nothing, trade, close). Only if the prediction is "trade" does it output the detailed trade parameters (call/put, strike, maturity, buy/sell, quantity).
 
 ---
 
