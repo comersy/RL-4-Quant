@@ -99,6 +99,14 @@ def load_day(date_str: str) -> dict:
     }
 
 
+
+def max_options_per_day() -> int:
+    """Scan all available days and return the max number of options seen in one day."""
+    days = list_available_days()
+    return max((len(load_day(d)["options"]) for d in days), default=0)
+
+
+
 if __name__ == "__main__":
     days = list_available_days()
     print(f"Found {len(days)} days in {RAW_DIR}")

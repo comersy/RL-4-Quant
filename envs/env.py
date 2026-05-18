@@ -79,7 +79,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from datetime import datetime
 
-from data.loader   import list_available_days, load_day
+from data.loader   import list_available_days, load_day, max_options_per_day
 from envs.pricing  import black_scholes
 
 
@@ -87,7 +87,6 @@ from envs.pricing  import black_scholes
 
 EPISODE_DAYS   = 90      # length of an episode in calendar days
 SPOT_HISTORY   = 365     # days of past spot shown in observation
-MAX_OPTIONS    = 1000    # max options per day (padded)
 MAX_PORTFOLIO  = 10000    # max open positions
 MAX_QTY        = 100     # max contracts per trade
 MAX_TRADES     = 500      # max trades per step
@@ -118,6 +117,7 @@ class OptionsEnv(gym.Env):
         self.realized_pnl    = 0.0
         self.unrealized_pnl  = 0.0
         self.today_options   = []      # list of dicts (today's tradable options)
+        self.MAX_OPTIONS    = max_options_per_day()   # max options per day
 
         # action space: MAX_TRADES tuples of (type_action, option_index, quantite, close_index)
         single_trade = spaces.Dict({
