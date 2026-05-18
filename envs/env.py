@@ -88,9 +88,9 @@ from envs.pricing  import black_scholes
 EPISODE_DAYS   = 90      # length of an episode in calendar days
 SPOT_HISTORY   = 365     # days of past spot shown in observation
 MAX_OPTIONS    = 1000    # max options per day (padded)
-MAX_PORTFOLIO  = 200     # max open positions
+MAX_PORTFOLIO  = 10000    # max open positions
 MAX_QTY        = 100     # max contracts per trade
-MAX_TRADES     = 15      # max trades per step
+MAX_TRADES     = 500      # max trades per step
 
 
 class OptionsEnv(gym.Env):
