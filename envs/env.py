@@ -19,8 +19,8 @@ Flat float32 vector:
   Market info:
     [0]              : current BTC spot (USD)
     [1]              : day index inside the episode (0..89)
-    [2 : 367]        : spot history of the LAST 365 days (USD), padded with 0
-                       at the start if data is shorter
+    [2 : 367]        : spot history of the LAST 365 days (USD)
+                        (episode always starts after at least 365 days of data)
 
   Option grid (today's tradable options, padded to MAX_OPTIONS):
     per option: [option_type, strike, days_to_expiry, price_btc, iv, volume]
@@ -312,9 +312,8 @@ class OptionsEnv(gym.Env):
         spot      = self.current_data["spot"] if self.current_data["spot"] is not None else 0.0
         day_today = datetime.strptime(self.all_days[self.current_day_idx], "%Y-%m-%d")
 
-        # spot history
-        hist = np.zeros(SPOT_HISTORY, dtype=np.float32)
-        hist[-min(len(self.spot_history), SPOT_HISTORY):] = self.spot_history[-SPOT_HISTORY:]
+        # spot history (always full thanks to reset constraint)
+        hist = np.array(self.spot_history[-SPOT_HISTORY:], dtype=np.float32)
 
         # option grid
         opt_vec = np.zeros((MAX_OPTIONS, 6), dtype=np.float32)
