@@ -1,5 +1,5 @@
 """
-RL environment for BTC options trading on real Deribit data.
+RL environment for BTC options trading on real data.
 
 =============================================================================
 OVERVIEW
