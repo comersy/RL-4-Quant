@@ -22,9 +22,9 @@ Flat float32 vector:
     [2 : 367]        : spot history of the LAST 365 days (USD)
                         (episode always starts after at least 365 days of data)
 
-  Option grid (today's tradable options, padded to MAX_OPTIONS):
+  Option grid (today's tradable options, padded to self.MAX_OPTIONS):
     per option: [option_type, strike, days_to_expiry, price_btc, iv, volume]
-    -> shape: (MAX_OPTIONS x 6,)
+    -> shape: (self.MAX_OPTIONS x 6,)
     Empty slots filled with zeros.
 
   Portfolio (up to MAX_PORTFOLIO open positions):
@@ -48,8 +48,8 @@ The agent outputs MAX_TRADES slots. Each slot is:
     2 = sell  (uses option_index, quantite)
     3 = close (uses close_index)
 
-  option_index : Discrete(MAX_OPTIONS)  - index in today's option list
-  quantite     : Discrete(MAX_QTY)      - contracts, >= 1
+  option_index : Discrete(self.MAX_OPTIONS)  - index in today's option list
+  quantite     : Discrete(MAX_QTY)           - contracts, >= 1
   close_index  : Discrete(MAX_PORTFOLIO)
 
 -----------------------------------------------------------------------------
@@ -85,11 +85,11 @@ from envs.pricing  import black_scholes
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-EPISODE_DAYS   = 90      # length of an episode in calendar days
-SPOT_HISTORY   = 365     # days of past spot shown in observation
-MAX_PORTFOLIO  = 10000    # max open positions
-MAX_QTY        = 100     # max contracts per trade
-MAX_TRADES     = 500      # max trades per step
+EPISODE_DAYS  = 90        # length of an episode in calendar days
+SPOT_HISTORY  = 365       # days of past spot shown in observation
+MAX_PORTFOLIO = 10000     # max open positions
+MAX_QTY       = 100       # max contracts per trade
+MAX_TRADES    = 500       # max trades per step
 
 
 class OptionsEnv(gym.Env):
@@ -112,17 +112,17 @@ class OptionsEnv(gym.Env):
         self.current_day_idx = 0
         self.episode_day     = 0
         self.current_data    = None
-        self.spot_history    = []      # past SPOT_HISTORY spots
-        self.portfolio       = []      # open positions
+        self.spot_history    = []
+        self.portfolio       = []
         self.realized_pnl    = 0.0
         self.unrealized_pnl  = 0.0
-        self.today_options   = []      # list of dicts (today's tradable options)
-        self.MAX_OPTIONS    = max_options_per_day()   # max options per day
+        self.today_options   = []
+        self.MAX_OPTIONS     = max_options_per_day()   # computed from data
 
-        # action space: MAX_TRADES tuples of (type_action, option_index, quantite, close_index)
+        # action space
         single_trade = spaces.Dict({
             "type_action":  spaces.Discrete(4),
-            "option_index": spaces.Discrete(MAX_OPTIONS),
+            "option_index": spaces.Discrete(self.MAX_OPTIONS),
             "quantite":     spaces.Discrete(MAX_QTY),
             "close_index":  spaces.Discrete(MAX_PORTFOLIO),
         })
@@ -130,11 +130,11 @@ class OptionsEnv(gym.Env):
 
         # observation space (flat float32 vector)
         obs_size = (
-            2                       # spot, episode_day
-            + SPOT_HISTORY          # past spots
-            + MAX_OPTIONS * 6       # tradable options
-            + MAX_PORTFOLIO * 8     # portfolio
-            + 2                     # realized + unrealized pnl
+            2                            # spot, episode_day
+            + SPOT_HISTORY               # past spots
+            + self.MAX_OPTIONS * 6       # tradable options
+            + MAX_PORTFOLIO * 8          # portfolio
+            + 2                          # realized + unrealized pnl
         )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
@@ -145,50 +145,37 @@ class OptionsEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # pick a random start day with at least EPISODE_DAYS ahead
         max_start = len(self.all_days) - EPISODE_DAYS - 1
-        # and at least SPOT_HISTORY days of past data
         min_start = SPOT_HISTORY
         self.start_day_idx   = int(self.np_random.integers(min_start, max_start + 1))
         self.current_day_idx = self.start_day_idx
         self.episode_day     = 0
 
-        # reset portfolio and pnl
         self.portfolio      = []
         self.realized_pnl   = 0.0
         self.unrealized_pnl = 0.0
 
-        # build past spot history
         self.spot_history = []
         for i in range(self.start_day_idx - SPOT_HISTORY, self.start_day_idx):
-            day_str = self.all_days[i]
-            data = load_day(day_str)
+            data = load_day(self.all_days[i])
             self.spot_history.append(data["spot"] if data["spot"] is not None else 0.0)
 
-        # load the starting day's data
         self._load_current_day()
-
         return self._get_obs(), {}
 
     # ── Step ──────────────────────────────────────────────────────────────────
 
     def step(self, action):
-        # 1. execute trades
         for slot in action:
             self._execute_trade(slot)
 
-        # 2. advance one day
         self.current_day_idx += 1
         self.episode_day     += 1
         self._load_current_day()
-
-        # 3. mark to market (handles expirations too)
         self._mark_to_market()
 
-        # 4. reward only on the final day
         terminated = self.episode_day >= EPISODE_DAYS - 1
         reward     = self.realized_pnl if terminated else 0.0
-
         return self._get_obs(), float(reward), terminated, False, {}
 
     # ── Day loading ───────────────────────────────────────────────────────────
@@ -197,12 +184,10 @@ class OptionsEnv(gym.Env):
         day_str           = self.all_days[self.current_day_idx]
         self.current_data = load_day(day_str)
 
-        # update the rolling spot history
         if self.current_data["spot"] is not None:
             self.spot_history.append(self.current_data["spot"])
             self.spot_history = self.spot_history[-SPOT_HISTORY:]
 
-        # filter out options expiring today (we trade at end of day)
         today              = datetime.strptime(day_str, "%Y-%m-%d")
         self.today_options = [
             o for o in self.current_data["options"]
@@ -222,10 +207,9 @@ class OptionsEnv(gym.Env):
                 self._close(idx)
             return
 
-        # buy or sell
         opt_idx = int(slot["option_index"])
         if opt_idx >= len(self.today_options):
-            return  # invalid index -> ignore
+            return
         opt = self.today_options[opt_idx]
 
         qty        = max(1, int(slot["quantite"]))
@@ -262,7 +246,6 @@ class OptionsEnv(gym.Env):
     # ── Mark to market ────────────────────────────────────────────────────────
 
     def _mark_to_market(self):
-        """Update open positions, handle expirations, recompute unrealized P&L."""
         opts_by_instr = {o["instrument"]: o for o in self.current_data["options"]}
         spot          = self.current_data["spot"]
         if spot is None:
@@ -271,7 +254,6 @@ class OptionsEnv(gym.Env):
         unrealized    = 0.0
 
         for p in self.portfolio:
-            # 1. expiration
             if p["expiry"] <= day_today:
                 payoff_usd = (max(spot - p["strike"], 0.0) if p["option_type"] == "call"
                               else max(p["strike"] - spot, 0.0))
@@ -281,14 +263,12 @@ class OptionsEnv(gym.Env):
                 p["expired"] = True
                 continue
 
-            # 2. mark to market
             o = opts_by_instr.get(p["instrument"])
             if o is not None:
                 p["price"]   = o["price"]
                 p["iv_last"] = o["iv"] if o["iv"] > 0 else p["iv_last"]
                 p["stale"]   = False
             else:
-                # Black-Scholes fallback
                 days_left = (p["expiry"] - day_today).days
                 T         = max(days_left, 1) / 365
                 sigma     = p["iv_last"] / 100
@@ -299,7 +279,6 @@ class OptionsEnv(gym.Env):
                 p["price"] = price_usd / spot if spot > 0 else 0.0
                 p["stale"] = True
 
-            # 3. unrealized P&L
             sign        = -1 if p["is_short"] else 1
             unrealized += sign * (p["price"] - p["entry_price"]) * p["quantity"]
 
@@ -312,12 +291,10 @@ class OptionsEnv(gym.Env):
         spot      = self.current_data["spot"] if self.current_data["spot"] is not None else 0.0
         day_today = datetime.strptime(self.all_days[self.current_day_idx], "%Y-%m-%d")
 
-        # spot history (always full thanks to reset constraint)
         hist = np.array(self.spot_history[-SPOT_HISTORY:], dtype=np.float32)
 
-        # option grid
-        opt_vec = np.zeros((MAX_OPTIONS, 6), dtype=np.float32)
-        for i, o in enumerate(self.today_options[:MAX_OPTIONS]):
+        opt_vec = np.zeros((self.MAX_OPTIONS, 6), dtype=np.float32)
+        for i, o in enumerate(self.today_options[:self.MAX_OPTIONS]):
             days_to_exp = (o["expiry"] - day_today).days
             opt_vec[i] = [
                 1.0 if o["option_type"] == "call" else 0.0,
@@ -328,7 +305,6 @@ class OptionsEnv(gym.Env):
                 o["volume"],
             ]
 
-        # portfolio
         port_vec = np.zeros((MAX_PORTFOLIO, 8), dtype=np.float32)
         for i, p in enumerate(self.portfolio[:MAX_PORTFOLIO]):
             days_to_exp = (p["expiry"] - day_today).days
