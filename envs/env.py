@@ -5,7 +5,8 @@ RL environment for BTC options trading on real data.
 OVERVIEW
 =============================================================================
 Each episode lasts 90 calendar days. The agent starts at a random day in the
-dataset (with at least 90 days of data ahead) and trades day by day.
+dataset, with at least 365 days of past spot history behind and 90 days of
+data ahead. The agent then trades day by day.
 
 At each step the agent can place up to MAX_TRADES trades from the options
 actually traded that day on Deribit. The data is real historical data
