@@ -4,16 +4,14 @@ Interactive trading desk on REAL Deribit BTC options data.
 Loads day-by-day data from data/raw/ and lets the user trade.
 
 Two P&L tracked:
-    - realized P&L : actual cash movements (premiums paid/received, payoffs)
+    - realized P&L : actual cash movements (premiums, payoffs)
     - unrealized P&L : current market value of open positions
 """
 
 import sys
 import os
-
 sys.path.insert(0, os.path.dirname(__file__))
 
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -22,25 +20,32 @@ from PyQt5.QtCore    import Qt
 from PyQt5.QtGui     import QFont, QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
-    QHBoxLayout, QVBoxLayout, QGridLayout,
+    QHBoxLayout, QVBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit,
-    QScrollArea, QSizePolicy,
+    QScrollArea,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
+from datetime    import datetime
 from data.loader import list_available_days, load_day
+from envs.pricing import black_scholes
+
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+SPOT_HISTORY = 365   # days of past spot shown at start
 
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 
-BG      = "#ffffff"
-BG2     = "#f5f5f5"
-BORDER  = "#dddddd"
-GREEN   = "#00aa66"
-RED     = "#dd2244"
-FG      = "#111111"
-FG2     = "#666666"
-MONO    = "Courier"
+BG     = "#ffffff"
+BG2    = "#f5f5f5"
+BORDER = "#dddddd"
+GREEN  = "#00aa66"
+RED    = "#dd2244"
+FG     = "#111111"
+FG2    = "#666666"
+MONO   = "Courier"
 
 
 class TradingApp(QMainWindow):
@@ -50,21 +55,29 @@ class TradingApp(QMainWindow):
         self.setWindowTitle("RL-4-Quant // Real Data Trading Desk")
         self.resize(1400, 880)
 
-        # session state
         self.days           = list_available_days()
-        self.day_index      = 0
-        self.current_data   = None        # dict from load_day
-        self.spot_history   = []
-        self.portfolio      = []          # open positions
+        self.day_index      = SPOT_HISTORY            # start after history buffer
+        self.current_data   = None
+        self.spot_history   = []                      # last SPOT_HISTORY spots
+        self.portfolio      = []
         self.realized_pnl   = 0.0
         self.unrealized_pnl = 0.0
         self.realized_hist  = []
         self.log            = []
 
         self._build_ui()
+        if len(self.days) > SPOT_HISTORY:
+            self._init_history_and_start()
 
-        if self.days:
-            self._goto_day(0)
+    # ── Init history then load start day ──────────────────────────────────────
+
+    def _init_history_and_start(self):
+        """Preload SPOT_HISTORY days of past spot, then load the current day."""
+        self.spot_history = []
+        for i in range(self.day_index - SPOT_HISTORY, self.day_index):
+            data = load_day(self.days[i])
+            self.spot_history.append(data["spot"] if data["spot"] is not None else 0.0)
+        self._goto_day(self.day_index)
 
     # ── UI build ──────────────────────────────────────────────────────────────
 
@@ -92,18 +105,16 @@ class TradingApp(QMainWindow):
         self.lbl_unreal   = self._metric(top, "UNREALIZED P&L", "0.00", color=GREEN)
         root_layout.addLayout(top)
 
-        # main layout: left (chart + options) + right (controls)
         main = QHBoxLayout()
         main.setSpacing(12)
         root_layout.addLayout(main, stretch=1)
 
-        # ── LEFT ──────────────────────────────────────────────────────────────
+        # LEFT
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
 
-        # spot chart
         self.fig = plt.Figure(figsize=(8, 3.5), facecolor=BG)
         gs = gridspec.GridSpec(1, 1, figure=self.fig)
         self.ax_spot = self.fig.add_subplot(gs[0])
@@ -112,7 +123,6 @@ class TradingApp(QMainWindow):
         self.canvas.setFixedHeight(220)
         left_layout.addWidget(self.canvas)
 
-        # options table
         self._sep_above(left_layout, "OPTIONS OF THE DAY")
         self.table = QTableWidget()
         self.table.setColumnCount(8)
@@ -130,7 +140,7 @@ class TradingApp(QMainWindow):
 
         main.addWidget(left, stretch=1)
 
-        # ── RIGHT (controls) ──────────────────────────────────────────────────
+        # RIGHT
         right = QWidget()
         right.setFixedWidth(310)
         right_layout = QVBoxLayout(right)
@@ -140,17 +150,14 @@ class TradingApp(QMainWindow):
         main.addWidget(right)
 
     def _build_controls(self, parent):
-        # navigation
         self._sep(parent, "NAVIGATE")
         nav = self._panel()
         nav_layout = QVBoxLayout(nav)
         nav_layout.setContentsMargins(8, 8, 8, 8)
-        nav_layout.addWidget(self._btn("▶  Next Day",  FG,   self._next_day))
-        nav_layout.addWidget(self._btn("⏮  Prev Day",  FG2,  self._prev_day))
-        nav_layout.addWidget(self._btn("↺  Restart",   FG2,  self._restart))
+        nav_layout.addWidget(self._btn("▶  Next Day", FG, self._next_day))
+        nav_layout.addWidget(self._btn("↺  Restart",  FG2, self._restart))
         parent.addWidget(nav)
 
-        # portfolio
         self._sep(parent, "PORTFOLIO")
         self.port_frame = self._panel()
         self.port_layout = QVBoxLayout(self.port_frame)
@@ -163,7 +170,6 @@ class TradingApp(QMainWindow):
         port_scroll.setWidget(self.port_frame)
         parent.addWidget(port_scroll)
 
-        # trade log
         self._sep(parent, "TRADE LOG")
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -174,53 +180,15 @@ class TradingApp(QMainWindow):
 
     def _stylesheet(self):
         return f"""
-        QWidget#root {{
-            background: {BG};
-            color: {FG};
-            font-family: {MONO};
-        }}
-        QLabel {{
-            color: {FG};
-            background: transparent;
-        }}
-        QLineEdit {{
-            background: {BG};
-            color: {FG};
-            border: 1px solid {BORDER};
-            padding: 2px 4px;
-        }}
-        QPushButton {{
-            border: none;
-            padding: 6px 8px;
-            font-weight: bold;
-        }}
-        QTextEdit {{
-            background: {BG2};
-            color: {FG2};
-            border: none;
-        }}
-        QScrollArea {{
-            border: none;
-            background: {BG2};
-        }}
-        QTableWidget {{
-            background: {BG};
-            color: {FG};
-            gridline-color: {BORDER};
-            font-family: {MONO};
-            font-size: 11px;
-        }}
-        QTableWidget::item {{
-            padding: 2px 4px;
-        }}
-        QHeaderView::section {{
-            background: {BG2};
-            color: {FG2};
-            border: none;
-            padding: 4px;
-            font-weight: bold;
-            font-size: 10px;
-        }}
+        QWidget#root {{ background: {BG}; color: {FG}; font-family: {MONO}; }}
+        QLabel {{ color: {FG}; background: transparent; }}
+        QLineEdit {{ background: {BG}; color: {FG}; border: 1px solid {BORDER}; padding: 2px 4px; }}
+        QPushButton {{ border: none; padding: 6px 8px; font-weight: bold; }}
+        QTextEdit {{ background: {BG2}; color: {FG2}; border: none; }}
+        QScrollArea {{ border: none; background: {BG2}; }}
+        QTableWidget {{ background: {BG}; color: {FG}; gridline-color: {BORDER}; font-family: {MONO}; font-size: 11px; }}
+        QTableWidget::item {{ padding: 2px 4px; }}
+        QHeaderView::section {{ background: {BG2}; color: {FG2}; border: none; padding: 4px; font-weight: bold; font-size: 10px; }}
         """
 
     def _metric(self, parent, label, value, color=FG):
@@ -229,19 +197,16 @@ class TradingApp(QMainWindow):
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(1)
-
         name = QLabel(label)
         name.setAlignment(Qt.AlignCenter)
         name.setStyleSheet(f"color: {FG2};")
         name.setFont(QFont(MONO, 7))
         layout.addWidget(name)
-
         val = QLabel(value)
         val.setAlignment(Qt.AlignCenter)
         val.setStyleSheet(f"color: {color};")
         val.setFont(QFont(MONO, 12, QFont.Bold))
         layout.addWidget(val)
-
         parent.addWidget(frame)
         return val
 
@@ -286,9 +251,11 @@ class TradingApp(QMainWindow):
         if idx < 0 or idx >= len(self.days):
             return
         self.day_index    = idx
-        date_str          = self.days[idx]
-        self.current_data = load_day(date_str)
-        self.spot_history.append(self.current_data["spot"])
+        self.current_data = load_day(self.days[idx])
+        spot = self.current_data["spot"]
+        if spot is not None:
+            self.spot_history.append(spot)
+            self.spot_history = self.spot_history[-(SPOT_HISTORY + idx):]
         self._mark_to_market()
         self.realized_hist.append(self.realized_pnl)
         self._refresh()
@@ -297,23 +264,15 @@ class TradingApp(QMainWindow):
         if self.day_index + 1 < len(self.days):
             self._goto_day(self.day_index + 1)
 
-    def _prev_day(self):
-        if self.day_index > 0:
-            # rewind one day: pop last spot/history (no rollback on portfolio)
-            self.spot_history  = self.spot_history[:-1]
-            self.realized_hist = self.realized_hist[:-1]
-            self._goto_day(self.day_index - 1)
-
     def _restart(self):
-        self.day_index      = 0
-        self.spot_history   = []
+        self.day_index      = SPOT_HISTORY
         self.portfolio      = []
         self.realized_pnl   = 0.0
         self.unrealized_pnl = 0.0
         self.realized_hist  = []
         self.log            = []
-        if self.days:
-            self._goto_day(0)
+        if len(self.days) > SPOT_HISTORY:
+            self._init_history_and_start()
 
     # ── Trades ────────────────────────────────────────────────────────────────
 
@@ -322,16 +281,18 @@ class TradingApp(QMainWindow):
             return
         price = opt["price"]
         if side == "BUY":
-            self.realized_pnl -= price * qty           # pay the premium
+            self.realized_pnl -= price * qty
         else:
-            self.realized_pnl += price * qty           # receive the premium
+            self.realized_pnl += price * qty
 
         self.portfolio.append({
             **opt,
             "quantity":    qty,
             "is_short":    side == "SELL",
             "entry_price": price,
-            "price":  price,
+            "price":       price,
+            "iv_last":     opt["iv"] if opt["iv"] > 0 else 50.0,
+            "stale":       False,
             "entry_date":  self.days[self.day_index],
         })
         self.log.append(
@@ -347,11 +308,10 @@ class TradingApp(QMainWindow):
             return
         p     = self.portfolio[idx]
         price = p["price"]
-        # close = reverse trade at current market price
         if p["is_short"]:
-            self.realized_pnl -= price * p["quantity"]    # buy back
+            self.realized_pnl -= price * p["quantity"]
         else:
-            self.realized_pnl += price * p["quantity"]    # sell
+            self.realized_pnl += price * p["quantity"]
         side = "BUY back" if p["is_short"] else "SELL"
         self.log.append(
             f"{self.days[self.day_index]} | CLOSE {side} {p['option_type'].upper():4} "
@@ -362,33 +322,59 @@ class TradingApp(QMainWindow):
         self._refresh()
 
     def _mark_to_market(self):
-        """Update price of open positions using today's data, recompute unrealized P&L."""
+        """Update price of open positions, handle expirations, recompute unrealized P&L."""
         opts_by_instr = {o["instrument"]: o for o in self.current_data["options"]}
-        unrealized = 0.0
+        spot          = self.current_data["spot"]
+        day_today     = datetime.strptime(self.days[self.day_index], "%Y-%m-%d")
+        unrealized    = 0.0
+
         for p in self.portfolio:
+            # 1. expiration
+            if p["expiry"] <= day_today:
+                payoff_usd = (max(spot - p["strike"], 0.0) if p["option_type"] == "call"
+                              else max(p["strike"] - spot, 0.0))
+                payoff_btc = payoff_usd / spot if spot > 0 else 0.0
+                sign       = -1 if p["is_short"] else 1
+                self.realized_pnl += sign * payoff_btc * p["quantity"]
+                self.log.append(
+                    f"{self.days[self.day_index]} | EXPIRED {p['option_type'].upper():4} "
+                    f"K={p['strike']:.0f} payoff={payoff_btc:.4f} BTC qty={p['quantity']}"
+                )
+                p["expired"] = True
+                continue
+
+            # 2. mark to market
             o = opts_by_instr.get(p["instrument"])
             if o is not None:
-                p["price"] = o["price"]
-            sign = -1 if p["is_short"] else 1
+                p["price"]   = o["price"]
+                p["iv_last"] = o["iv"] if o["iv"] > 0 else p.get("iv_last", 50.0)
+                p["stale"]   = False
+            else:
+                days_left = (p["expiry"] - day_today).days
+                T         = max(days_left, 1) / 365
+                sigma     = p.get("iv_last", 50.0) / 100
+                price_usd = black_scholes(S=spot, K=p["strike"], T=T, r=0.0,
+                                          sigma=sigma, option_type=p["option_type"])
+                p["price"] = price_usd / spot if spot > 0 else 0.0
+                p["stale"] = True
+
+            sign        = -1 if p["is_short"] else 1
             unrealized += sign * (p["price"] - p["entry_price"]) * p["quantity"]
+
+        self.portfolio      = [p for p in self.portfolio if not p.get("expired")]
         self.unrealized_pnl = unrealized
 
     # ── Refresh UI ────────────────────────────────────────────────────────────
 
     def _refresh(self):
         d = self.current_data
-
         self.lbl_date.setText(d["date"])
         self.lbl_spot.setText(f"${d['spot']:.2f}")
         self.lbl_options.setText(str(len(d["options"])))
         self.lbl_realized.setText(f"{self.realized_pnl:+.4f} BTC")
-        self.lbl_realized.setStyleSheet(
-            f"color: {GREEN if self.realized_pnl >= 0 else RED};"
-        )
+        self.lbl_realized.setStyleSheet(f"color: {GREEN if self.realized_pnl >= 0 else RED};")
         self.lbl_unreal.setText(f"{self.unrealized_pnl:+.4f} BTC")
-        self.lbl_unreal.setStyleSheet(
-            f"color: {GREEN if self.unrealized_pnl >= 0 else RED};"
-        )
+        self.lbl_unreal.setStyleSheet(f"color: {GREEN if self.unrealized_pnl >= 0 else RED};")
 
         self._draw_spot_chart()
         self._fill_options_table()
@@ -399,12 +385,29 @@ class TradingApp(QMainWindow):
     def _draw_spot_chart(self):
         self.ax_spot.cla()
         self._style_axes(self.ax_spot)
-        self.ax_spot.plot(self.spot_history, color=GREEN, lw=1.5)
-        self.ax_spot.set_title("BTC Spot (USD)", color=FG2, fontsize=8, pad=3)
+        n_hist = len(self.spot_history) - len(self.realized_hist)  # past data points
+        # draw history in grey, traded days in green
+        if n_hist > 0:
+            self.ax_spot.plot(range(n_hist), self.spot_history[:n_hist],
+                              color=BORDER, lw=1.5)
+        if len(self.realized_hist) > 0:
+            x = list(range(n_hist - 1, len(self.spot_history))) if n_hist > 0 \
+                else list(range(len(self.spot_history)))
+            y = (self.spot_history[n_hist - 1:] if n_hist > 0
+                 else self.spot_history)
+            self.ax_spot.plot(x, y, color=GREEN, lw=1.5)
+        if n_hist > 0:
+            self.ax_spot.axvline(x=n_hist - 1, color=BORDER, lw=1, ls="--")
+        self.ax_spot.set_title("BTC Spot (USD)  |  grey = history   green = trading",
+                               color=FG2, fontsize=8, pad=3)
         self.canvas.draw()
 
     def _fill_options_table(self):
-        opts = sorted(self.current_data["options"], key=lambda o: (o["expiry"], o["strike"]))
+        day_today = datetime.strptime(self.days[self.day_index], "%Y-%m-%d")
+        opts = sorted(
+            [o for o in self.current_data["options"] if o["expiry"].date() > day_today.date()],
+            key=lambda o: (o["expiry"], o["strike"])
+        )
         self.table.setRowCount(len(opts))
 
         for row, o in enumerate(opts):
@@ -415,18 +418,15 @@ class TradingApp(QMainWindow):
             self.table.setItem(row, 4, QTableWidgetItem(f"{o['iv']:.1f}"))
             self.table.setItem(row, 5, QTableWidgetItem(f"{o['volume']:.1f}"))
 
-            # color call/put cell
             color = GREEN if o["option_type"] == "call" else RED
             self.table.item(row, 0).setForeground(QColor(color))
 
-            # qty input
             qty_edit = QLineEdit("1")
             qty_edit.setFixedWidth(40)
             qty_edit.setAlignment(Qt.AlignRight)
             qty_edit.setFont(QFont(MONO, 9))
             self.table.setCellWidget(row, 6, qty_edit)
 
-            # action buttons in last column
             action = QWidget()
             h = QHBoxLayout(action)
             h.setContentsMargins(0, 0, 0, 0)
@@ -468,6 +468,7 @@ class TradingApp(QMainWindow):
             unrealized = (-1 if p["is_short"] else 1) * (p["price"] - p["entry_price"]) * p["quantity"]
             color      = GREEN if unrealized >= 0 else RED
             sign       = "+" if unrealized >= 0 else ""
+            tag        = " (BS)" if p.get("stale") else ""
 
             row = QWidget()
             h = QHBoxLayout(row)
@@ -475,7 +476,7 @@ class TradingApp(QMainWindow):
             h.setSpacing(4)
 
             text = (f"{side} {p['option_type'].upper():4} K={p['strike']:.0f} "
-                    f"qty={p['quantity']} ({sign}{unrealized:.4f})")
+                    f"qty={p['quantity']} ({sign}{unrealized:.4f}){tag}")
             label = QLabel(text)
             label.setFont(QFont(MONO, 7))
             label.setStyleSheet(f"color: {color};")
