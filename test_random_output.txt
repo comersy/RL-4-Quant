@@ -1,0 +1,27 @@
+Testing 3 resets with random initial positions:
+
+Episode 0:
+  - Starting positions: 4
+    SHORT CALL strike=  92000 qty=1.0 mat=31d
+    LONG  PUT  strike= 100000 qty=2.5 mat=10d
+    SHORT PUT  strike= 105000 qty=0.7 mat=31d
+    SHORT PUT  strike=  87000 qty=2.4 mat=10d
+  - Initial unrealized P&L: 0.000000 (should be ~0)
+  - After 3 steps: portfolio size = 4, realized_pnl = 0.000000
+
+Episode 1:
+  - Starting positions: 1
+    SHORT CALL strike=  60000 qty=2.0 mat=27d
+  - Initial unrealized P&L: 0.000000 (should be ~0)
+  - After 3 steps: portfolio size = 1, realized_pnl = 0.000000
+
+Episode 2:
+  - Starting positions: 4
+    SHORT PUT  strike= 106000 qty=1.2 mat=3d
+    LONG  CALL strike= 120000 qty=1.8 mat=43d
+    LONG  CALL strike= 112000 qty=0.9 mat=43d
+    LONG  CALL strike= 100000 qty=2.3 mat=8d
+  - Initial unrealized P&L: 0.000000 (should be ~0)
+  - After 3 steps: portfolio size = 3, realized_pnl = 0.000000
+
+✓ Test passed!

@@ -1,0 +1,54 @@
+Traceback (most recent call last):
+  File "/Users/augustinday/Documents/RL-4-Quant/test_env_train_compatibility.py", line 42, in test_environment
+    obs, reward, terminated, truncated, info = env.step(action)
+                                               ^^^^^^^^^^^^^^^^
+  File "/Users/augustinday/Documents/RL-4-Quant/envs/env.py", line 178, in step
+    self._execute_action(action)
+  File "/Users/augustinday/Documents/RL-4-Quant/envs/env.py", line 237, in _execute_action
+    self._open_position(option_type, strike, maturity, quantity_signed)
+  File "/Users/augustinday/Documents/RL-4-Quant/envs/env.py", line 290, in _open_position
+    "entry_price": option["mid_price"],
+                   ~~~~~~^^^^^^^^^^^^^
+KeyError: 'mid_price'
+Traceback (most recent call last):
+  File "/Users/augustinday/Documents/RL-4-Quant/test_env_train_compatibility.py", line 75, in test_agent
+    agent = GRUPPOAgent(obs_dim=2 + 365 + 500*6 + 10000*8 + 2, device='cpu')
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: GRUPPOAgent.__init__() got an unexpected keyword argument 'device'
+Traceback (most recent call last):
+  File "/Users/augustinday/Documents/RL-4-Quant/test_env_train_compatibility.py", line 113, in test_integration
+    agent = GRUPPOAgent(obs_dim=env.observation_space.shape[0], device='cpu')
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: GRUPPOAgent.__init__() got an unexpected keyword argument 'device'
+Using device: cpu
+
+============================================================
+TRAIN.PY & ENV.PY COMPATIBILITY CHECK
+============================================================
+
+============================================================
+TESTING ENVIRONMENT
+============================================================
+✓ OptionsEnv instantiated successfully
+✓ reset() works: obs shape = (86171,)
+✓ action_space keys: ['action_type', 'call_or_put', 'log_prob', 'maturity', 'quantity_signed', 'strike']
+✗ ENVIRONMENT TEST FAILED: KeyError: 'mid_price'
+
+============================================================
+TESTING AGENT
+============================================================
+✗ AGENT TEST FAILED: TypeError: GRUPPOAgent.__init__() got an unexpected keyword argument 'device'
+
+============================================================
+TESTING INTEGRATION
+============================================================
+✗ INTEGRATION TEST FAILED: TypeError: GRUPPOAgent.__init__() got an unexpected keyword argument 'device'
+
+============================================================
+SUMMARY
+============================================================
+✗ FAIL   Environment Tests
+✗ FAIL   Agent Tests
+✗ FAIL   Integration Tests
+
+✗ SOME TESTS FAILED - see details above

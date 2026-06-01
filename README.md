@@ -13,16 +13,11 @@
   - [Action Space](#action-space)
   - [Observation Space](#observation-space)
   - [Reward Function](#reward-function)
-- [Algorithm — GRU-SAC](#algorithm--gru-sac)
-  - [Why SAC](#why-sac)
-  - [Why GRU](#why-gru)
+- [Algorithm — GRU-PPO](#algorithm--gru-ppo)
+  - [Why PPO with Learned Decay Memory](#why-ppo-with-learned-decay-memory)
+  - [Why GRU with Learned Adaptive Decay](#why-gru-with-learned-adaptive-decay)
   - [Full Architecture](#full-architecture)
-- [Roadmap — Progressive Phases](#roadmap--progressive-phases)
-  - [Phase 1 — Baseline (Simulated, Minimal Obs)](#phase-1--baseline-simulated-minimal-obs)
-  - [Phase 2 — Technical Indicators](#phase-2--technical-indicators)
-  - [Phase 3 — Macro & Fundamentals](#phase-3--macro--fundamentals)
-  - [Phase 4 — Alternative Data & Real History](#phase-4--alternative-data--real-history)
-- [Key Financial Indicators](#key-financial-indicators)
+- [Current Implementation Status](#current-implementation-status)
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
 - [Getting Started](#getting-started)
@@ -41,13 +36,13 @@ The core hypothesis: **the more realistic and information-rich the observations,
 ## Core Idea
 
 - The agent receives a **fixed starting budget** at the beginning of each episode
-- It steps through **252 trading days** (1 simulated year)
-- At each step it can **do nothing, or place an options trade** (call/put, buy/sell)
-- Options are priced using **Black-Scholes** with realized volatility from the simulated path
-- The agent receives a **reward every quarter (every 84 days)**, equal to total P&L since episode start
-- The underlying asset price evolves via **Geometric Brownian Motion (GBM)** in early phases, and real historical data in later phases
+- It steps through **150 calendar days** of real Deribit options market data
+- At each day it can **do nothing, or place an options trade** (call/put, strike, maturity, quantity)
+- Options are priced from **real market data** (or Black-Scholes as fallback when data is sparse)
+- The agent receives a **single reward at the end of the episode**, equal to total P&L (realized + unrealized)
+- The underlying asset (BTC) prices come from **real historical data** (May 2023 — May 2026)
 
-The agent is **not given any predefined trading rules**. It must discover by itself when to buy protective puts, when to sell covered calls, when to go directional, and when to stay flat.
+The agent is **not given any predefined trading rules**. It must discover by itself when to buy protective puts, when to sell covered calls, when to go directional, when to hold across multiple days, and when to stay flat. The **sparse reward and long memory requirement** force it to learn deep temporal patterns.
 
 ---
 
@@ -55,13 +50,27 @@ The agent is **not given any predefined trading rules**. It must discover by its
 
 ### Environment
 
-- **Episode length**: 252 days (1 trading year)
-- **Underlying**: simulated via GBM (S₀, σ daily) → then real historical prices
-- **Options pricing**: Black-Scholes, using realized volatility of the current simulated path
-- **Budget**: fixed at episode start, tracks P&L across all open positions
-- **Positions**: the agent can hold multiple simultaneous options positions
+**Data Source**: Real historical options trading data from Deribit (BTC options)
+- **Date range**: May 19, 2023 — May 18, 2026 (3 years, ~1,100 trading days)
+- **Format**: Daily market snapshots stored in `data/raw/YYYY-MM-DD/`
+  - `meta.json`: BTC spot price at end of day
+  - `trades.csv`: all option trades (instrument, price, IV, volume)
 
-At the start of each episode, the full price path for the year is pre-simulated. This gives the agent access to a price history from day 1. The underlying then advances day by day regardless of the agent's actions.
+**Episode Structure**
+- **Episode length**: 150 calendar days
+- **Reset mechanism**: 
+  - Selects a random start date between day 365 and day (total_days - 151)
+  - Ensures 365 days of spot history are available (for observation)
+  - Guarantees 150 days of future data (for trading)
+- **Daily progression**: Agent steps through consecutive days, one at a time
+  - Environment loads actual market data from files for that day
+  - If option pricing data unavailable, falls back to **Black-Scholes** (σ = last known IV or 50% default)
+
+**Position Management**
+- Agent can hold multiple simultaneous options positions (calls and puts, various strikes/maturities)
+- Positions can extend **beyond the 150-day episode** — no forced expiration
+- At episode end, remaining positions are valued at **mark-to-market** (actual prices or Black-Scholes)
+- This forces the agent to learn maturity management, not just position opening
 
 ### Action Space
 
@@ -80,73 +89,73 @@ This design is **cleaner than separating buy/sell**: the sign of `quantity_signe
 
 ### Observation Space
 
-Observations are structured progressively across phases (see [Roadmap](#roadmap--progressive-phases)). At full capacity (Phase 4), the observation vector includes:
+A flat float32 vector includes:
 
-**Market state**
-- Current spot price + normalized price history (5d, 10d, 20d windows)
-- Daily log-returns + rolling statistics
+**Market State** (2 values)
+- Current BTC spot price (USD)
+- Day index within episode (0–89)
 
-**Volatility**
-- Realized volatility (5d, 20d, 60d windows)
-- Volatility of volatility (vol-of-vol)
-- VIX / implied volatility (Phase 3+)
+**Price History** (365 values)
+- Past 365 days of BTC spot prices (for trend/volatility context)
 
-**Technical indicators** *(Phase 2+)*
-- RSI (14d)
-- MACD + signal line
-- Bollinger Bands (upper, lower, %B)
-- Momentum (10d, 20d)
-- Skewness and kurtosis of recent returns
+**Tradable Options** (500 × 6 = 3,000 values, padded)
+For each available option on the day:
+- Call/put flag (1.0 or 0.0)
+- Strike price
+- Days to expiration
+- Mid-price (BTC or USD)
+- Implied volatility (%)
+- Volume traded
 
-**Options & Greeks** *(Phase 2+)*
-- Delta, Gamma, Vega, Theta of current portfolio
-- Portfolio-level net delta / net gamma exposure
+**Open Positions** (10,000 × 8 = 80,000 values, padded)
+For each position in agent's portfolio:
+- Call/put flag
+- Strike price
+- Days remaining to expiry (can be negative if expired; still mark-to-market)
+- Quantity (absolute value)
+- Is-short flag (1.0 if short, 0.0 if long)
+- Entry price
+- Current mark-to-market price
+- Unrealized P&L on position
 
-**Portfolio state**
-- Current budget / remaining cash
-- Current total P&L
-- Open positions: strike, maturity remaining, type, quantity (for each open leg)
-- Days remaining in episode
+**Portfolio Summary** (2 values)
+- Total realized P&L (from closed positions)
+- Total unrealized P&L (from open positions)
 
-**Macro & Fundamentals** *(Phase 3+)*
-- Risk-free rate (direct input to Black-Scholes)
-- Sector index performance
-- P/E ratio, beta vs market
-
-**Alternative data** *(Phase 4)*
-- NLP sentiment score from news / financial social media
-- Competitor price correlations
-- Macro releases: CPI, Fed rate decisions, PMI
+**Total observation dimension**: ~86,000 values
 
 ### Reward Function
 
-The primary reward is **quarterly P&L** (every 84 days). However, a pure sparse reward creates a severe credit assignment problem — the agent cannot easily link an action at day 3 to a gain at day 84.
-
-The shaped reward is:
+Reward is provided **only at the end of the episode** (day 150):
 
 ```
-R_total = R_pnl                          # main signal: quarterly P&L
-        + λ₁ × R_action_bonus            # small bonus per trade executed (fights passivity)
-        - λ₂ × R_drawdown_penalty        # penalty if drawdown exceeds threshold
-        - λ₃ × R_concentration_penalty   # penalty for over-concentration on a single trade
+R_final = Σ(realized P&L from closed positions) + Σ(unrealized P&L from open positions)
 ```
 
-**`R_action_bonus`** is the critical component to prevent the agent from converging to a do-nothing policy. A small positive reward is given for each trade executed, and a small negative reward is applied if the agent goes 5+ consecutive days without any action.
+This approach:
+- **Gives credit for mature decisions**: Positions that extend beyond the episode are marked-to-market, so the agent receives signal even if it doesn't liquidate
+- **Encourages holding vs. panic selling**: The agent learns that profitable positions should be held through the episode
+- **Simple and interpretable**: Total episodic profit, nothing more
+- **Sparse reward forces memory**: No intermediary rewards, agent depends on GRU to link actions to delayed consequences
+
+The **GRU's learned decay mechanism** is critical here — it helps the agent remember key market states and connect long-term consequences to earlier decisions.
 
 ---
 
-## Algorithm — GRU-SAC
+## Algorithm — GRU-PPO
 
-### Why SAC
+### Why PPO with Learned Decay Memory
 
-**Soft Actor-Critic (SAC)** is the right algorithm for this problem because:
+**Proximal Policy Optimization (PPO)** combined with a learned decay GRU is ideal for this problem:
 
-- **Continuous action space**: SAC is designed for continuous actions. The strike is unbounded and continuous — discretizing it coarsely would lose critical information about moneyness
-- **Maximum entropy objective**: SAC maximizes both reward *and* policy entropy. This prevents the agent from collapsing to a single repetitive strategy and naturally encourages exploration of diverse strikes, maturities, and trade types
-- **Sample efficiency**: far more sample-efficient than PPO on continuous spaces — important when each episode is 252 steps and training is expensive
-- **Stability**: SAC's twin critic architecture and temperature-tuned entropy make it significantly more stable than DDPG on noisy financial environments
+- **Continuous + discrete actions**: PPO handles mixed action spaces elegantly (discrete action_type, continuous strike/maturity/quantity)
+- **Stable training**: PPO clipping prevents catastrophic policy collapses, important for financial environments with noisy rewards
+- **Memory via GRU**: Long-term dependencies are critical (positions held 30+ days, multi-step strategies)
+- **Learned adaptation**: The **decay network** allows the agent to learn WHEN to remember vs. when to forget, adapting to market regimes
+- **Sample efficiency with limited data**: 3 years (1,100 days, ~7 episodes if non-overlapping) is tight — PPO is more sample-efficient than value-based methods
+- **End-to-end learning**: Gradients flow through the decay network, training it jointly with the policy
 
-### Why GRU with Learned Decay
+### Why GRU with Learned Adaptive Decay
 
 A memoryless agent sees only the current state of the market. It cannot:
 - Remember positions it opened 30 days ago
@@ -191,7 +200,7 @@ This is a **learned blend** between the new GRU state and previous memory. The n
 
 **Benefit**: The GRU becomes **context-aware**. When volatility spikes or the market regime changes, the decay network can reduce α_t and let old memories fade. When in a trend, it keeps α_t high. This is far more expressive than a fixed GRU.
 
-Since the reward is **sparse and quarterly**, recurrent memory with learned adaptive decay is essential for connecting multi-step decisions to delayed consequences.
+Since the reward is **sparse (only at episode end)**, recurrent memory with learned adaptive decay is essential for connecting multi-step decisions to delayed final consequences.
 
 ### Full Architecture
 
@@ -212,16 +221,16 @@ Observation (t)
     ╔════════════════════════════════════════════════════════════════╗
     ║          GRU Cell with Learned Adaptive Decay                  ║
     ║                                                                ║
-    ║  1. Standard GRU:                                             ║
-    ║     h_raw = GRU_cell(encoded_t, h_{t-1})                      ║
+    ║  1. Standard GRU:                                              ║
+    ║     h_raw = GRU_cell(encoded_t, h_{t-1})                       ║
     ║                                                                ║
-    ║  2. Decay Network (MLP):                                      ║
-    ║     decay_input = concat([h_{t-1}, encoded_t])                ║
-    ║     α_t = σ(MLP_decay(decay_input))    ← learns when to forget║
+    ║  2. Decay Network (MLP):                                       ║
+    ║     decay_input = concat([h_{t-1}, encoded_t])                 ║
+    ║     α_t = σ(MLP_decay(decay_input))    ← learns when to forget ║
     ║                                                                ║
-    ║  3. Adaptive Blend:                                           ║
-    ║     h_t = α_t ⊙ h_raw + (1 - α_t) ⊙ h_{t-1}                 ║
-    ║     │         └─ new state  │         └─ preserve memory      ║
+    ║  3. Adaptive Blend:                                            ║
+    ║     h_t = α_t ⊙ h_raw + (1 - α_t) ⊙ h_{t-1}                    ║
+    ║     │         └─ new state  │         └─ preserve memory       ║
     ║                                                                ║
     ╚════════════════════════════════════════════════════════════════╝
              │ h_t (context-aware memory)
@@ -230,7 +239,7 @@ Observation (t)
              ▼                             ▼                         ▼
     ┌──────────────────┐        ┌──────────────────┐    ┌──────────────────┐
     │      Actor       │        │   Critic (V)     │    │ (For monitoring) │
-    │   [256 → 128]    │        │  [256 → 128]     │    │  alpha ∈ [0, 1] │
+    │   [256 → 128]    │        │  [256 → 128]     │    │  alpha ∈ [0, 1]  │
     │                  │        │                  │    └──────────────────┘
     │  Outputs:        │        │  Outputs:        │
     │  • action_type   │        │  • state_value   │
@@ -285,54 +294,27 @@ Observation (t)
 
 ---
 
-## Roadmap — Progressive Phases
+## Current Implementation Status
 
-### Phase 1 — Baseline (Simulated, Minimal Obs)
+✅ **Completed**
+- Real Deribit BTC options data (May 2023 — May 2026)
+- GRU-PPO agent with learned adaptive decay memory
+- 150-day episodic training with random resets
+- Black-Scholes fallback for sparse option data
+- Mark-to-market valuation of open positions
+- Sparse reward (episode-end total P&L signal)
+- Continuous hierarchical action space with signed quantities
+- End-to-end training with decay network gradient flow
 
-**Goal**: establish that the agent can learn *something* before adding complexity.
-
-- Underlying: GBM with fixed S₀ and σ
-- Observations: spot price, price history (5d/20d), realized vol, P&L, budget, days remaining, open positions
-- Algorithm: LSTM-SAC, basic shaped reward
-- Data: 100% simulated, generated fresh each episode
-- Baseline to beat: a rule-based agent that buys calls when RSI < 30
-
-This phase validates the environment, the reward shaping, and the LSTM-SAC pipeline before any real data is introduced.
-
----
-
-### Phase 2 — Technical Indicators
-
-**Goal**: give the agent richer market signals to make more informed decisions.
-
-- Add RSI, MACD, Bollinger Bands, momentum, skewness/kurtosis to observations
-- Add portfolio Greeks (delta, gamma, vega, theta) to observations
-- Introduce **curriculum learning**: start with trending/easy markets, progressively add choppy/mean-reverting regimes
-- Upgrade GBM to **stochastic volatility** (Heston model) for more realistic price paths
-- Begin logging Tensorboard metrics: entropy, Q-values, action distributions, P&L per episode
-
----
-
-### Phase 3 — Macro & Fundamentals
-
-**Goal**: move toward a realistic market environment.
-
-- Add risk-free rate, VIX / implied vol, sector indices, P/E, beta to observations
-- Switch from pure GBM to **real historical price data** (via yfinance or equivalent) for the underlying
-- Introduce **SAC temperature tuning** — auto-adjust entropy coefficient as the agent becomes more confident
-- Evaluate on out-of-sample historical periods to check for overfitting
-
----
-
-### Phase 4 — Alternative Data & Real History
-
-**Goal**: maximum environment realism, full information agent.
-
-- Add NLP sentiment scores (news, financial social media) to observations
-- Add competitor / correlated asset prices
-- Add macro event indicators (CPI release, Fed decisions, earnings dates)
-- Explore **multi-asset extension**: agent trades options on a small basket of stocks
-- Consider **online learning**: agent continues updating from live market data
+🔄 **Potential Extensions**
+- Add technical indicators (RSI, MACD, Bollinger Bands) to observation
+- Implement portfolio Greeks (delta, gamma, vega, theta) computation
+- Add risk-free rate and macro indicators to observation
+- Multi-asset extension: options on multiple underlyings
+- Online learning: agent continues updating on live market data
+- Alternative data: sentiment scores, macro event indicators
+- Curriculum learning: start with trending/easy markets, add choppy regimes
+- Hyperparameter optimization: decay network architecture, learning rate scheduling
 
 ---
 
@@ -362,16 +344,14 @@ The following indicators are included across phases and why they matter for opti
 ## Tech Stack
 
 ```
-Python 3.11
-├── gymnasium              # custom options trading environment
-├── stable-baselines3      # SAC base implementation
-├── sb3-contrib            # RecurrentSAC / LSTM support
-├── torch                  # custom LSTM-SAC architecture
-├── numpy / pandas         # data handling
+Python 3.10+
+├── torch (2.0+)           # PPO agent, GRU, decay network
+├── gymnasium              # official RL environment API
+├── numpy                  # numerical computing
 ├── scipy                  # Black-Scholes pricing, statistics
-├── yfinance               # real historical data (Phase 3+)
-├── ta / ta-lib            # technical indicators (Phase 2+)
-└── tensorboard            # training monitoring (mandatory from day 1)
+├── pandas                 # data manipulation
+├── matplotlib             # plotting results
+└── requests               # API calls (for potential live data)
 ```
 
 ---
@@ -379,57 +359,125 @@ Python 3.11
 ## Project Structure
 
 ```
-rl-4-quant/
+RL-4-Quant/
 ├── README.md
 ├── requirements.txt
+├── .venv/                         # Python virtual environment
 │
-├── env/
-│   ├── options_env.py          # core Gym environment
-│   ├── gbm_simulator.py        # GBM / Heston price simulation
-│   ├── black_scholes.py        # BS pricing + Greeks
-│   └── reward.py               # shaped reward function
+├── data/
+│   ├── loader.py                  # Load daily Deribit snapshots from raw/
+│   ├── download.py                # Future: download from Deribit API
+│   └── raw/                       # Daily snapshots (2023-05-19 to 2026-05-18)
+│       ├── 2023-05-19/
+│       │   ├── meta.json          # {"spot": 26890.92}
+│       │   └── trades.csv         # instrument_name, price, iv, amount
+│       ├── 2023-05-20/
+│       └── ... (1096 days total)
 │
-├── agent/
-│   ├── lstm_sac.py             # LSTM-SAC full architecture
-│   ├── actor.py                # Actor network (μ, σ outputs)
-│   ├── critic.py               # Twin Critic networks
-│   └── replay_buffer.py        # sequential episode replay buffer
+├── envs/
+│   ├── env.py                     # OptionsEnv: Gymnasium-compatible environment
+│   │                              # - 150-day episodes, random reset
+│   │                              # - Real Deribit data, Black-Scholes fallback
+│   │                              # - Mark-to-market open positions
+│   │                              # - Continuous hierarchical actions
+│   ├── pricing.py                 # Black-Scholes call/put pricing
+│   └── __init__.py
 │
-├── observations/
-│   ├── phase1.py               # minimal obs builder
-│   ├── phase2.py               # + technical indicators + Greeks
-│   ├── phase3.py               # + macro + fundamentals
-│   └── phase4.py               # + alternative data
+├── RL_model/
+│   ├── train.py                   # Complete GRU-PPO training
+│   │                              # - GRUCell with learned decay network
+│   │                              # - Actor (hierarchical actions)
+│   │                              # - Critic (value function)
+│   │                              # - Training loop with GAE, PPO clipping
+│   └── __init__.py
 │
-├── training/
-│   ├── train.py                # main training loop
-│   ├── evaluate.py             # out-of-sample evaluation
-│   └── curriculum.py           # curriculum learning schedule
-│
-├── baselines/
-│   └── rule_based_agent.py     # RSI-based baseline to beat
-│
-└── logs/
-    └── tensorboard/            # training metrics
+├── test_env_train_compatibility.py # Verify environment ↔ agent integration
+├── test_random_positions.py        # Test random position initialization
+└── test_debug_integration.py       # Debug agent-env interaction
 ```
+
+**Key Files:**
+
+- **[envs/env.py](envs/env.py)**: The core environment
+  - Loads real Deribit data from `data/raw/`
+  - Handles 150-day episodes with random resets (guarantees 150-day horizon)
+  - Returns flat observation vector (~86k values)
+  - Accepts continuous hierarchical actions
+  - Reward: episode-end realized P&L + unrealized P&L
+
+- **[RL_model/train.py](RL_model/train.py)**: The learning agent
+  - `GRUCell`: GRU with learned adaptive decay network (MLP)
+  - `ActorNetwork`: Outputs hierarchical actions (action_type, call_or_put, strike, maturity, quantity_signed)
+  - `CriticNetwork`: Outputs state value for GAE calculation
+  - `GRUPPOAgent`: Full training loop with PPO clipping, entropy bonus, decay regularization
+
+- **[data/loader.py](data/loader.py)**: Data loading
+  - `list_available_days()`: Get sorted list of all available dates
+  - `load_day(date_str)`: Load spot + options data for a single day
+  - `max_options_per_day()`: Get maximum options count for padding
+
 
 ---
 
 ## Getting Started
 
 ```bash
-# Clone the repo
-git clone https://github.com/your-handle/rl-4-quant.git
-cd rl-4-quant
+# 1. Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-# Install dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# Run Phase 1 training
-python training/train.py --phase 1 --episodes 5000
+# 3. Run compatibility tests
+python test_env_train_compatibility.py
 
-# Monitor training
-tensorboard --logdir logs/tensorboard
+# 4. Train the agent
+#    (See RL_model/train.py for training configuration)
+python -c "
+from RL_model.train import GRUPPOAgent
+from envs.env import OptionsEnv
+
+config = {
+    'device': 'cpu',
+    'encoder_hidden_sizes': [128, 64],
+    'gru_hidden_size': 64,
+    'actor_hidden_sizes': [64, 32],
+    'critic_hidden_sizes': [64, 32],
+    'learning_rate': 3e-4,
+}
+
+env = OptionsEnv()
+agent = GRUPPOAgent(obs_dim=env.observation_space.shape[0], config=config)
+# Training loop (see RL_model/train.py for full implementation)
+"
+
+# 5. Evaluate on random initial positions (tests generalization)
+python -c "
+from RL_model.train import GRUPPOAgent
+from envs.env import OptionsEnv
+
+env_eval = OptionsEnv(init_random_positions=True)
+# Run evaluation episodes
+"
 ```
 
 ---
+
+## What's Next
+
+1. **Run training**: Start with the configuration in [RL_model/train.py](RL_model/train.py). The agent will learn to trade options using real Deribit data.
+
+2. **Monitor learning**: Log episode returns, realized P&L, unrealized P&L, action distributions, and decay factors over time.
+
+3. **Evaluate robustness**: Test the trained agent with `init_random_positions=True` to verify it can handle starting in unfamiliar portfolio states (not just empty).
+
+4. **Extend observations**: Add technical indicators (RSI, MACD), portfolio Greeks (delta, gamma), or macro indicators to the observation vector.
+
+5. **Experiment with decay**: Try different decay network architectures (deeper MLP, attention-based) to see if the agent learns more nuanced memory patterns.
+
+6. **Out-of-sample validation**: Evaluate the agent on held-out date ranges (e.g., train on 2023-2025, test on 2026 data) to assess generalization.
+
+---
+
+**Questions or issues?** Check the [compatibility tests](test_env_train_compatibility.py) or review the [environment documentation](envs/env.py).

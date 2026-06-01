@@ -4,8 +4,8 @@ RL environment for BTC options trading on real Deribit data.
 =============================================================================
 OVERVIEW
 =============================================================================
-Each episode lasts 90 calendar days. The agent starts at a random day in the
-dataset, with at least 365 days of past spot history behind and 90 days of
+Each episode lasts 150 calendar days. The agent starts at a random day in the
+dataset, with at least 365 days of past spot history behind and 150 days of
 data ahead. The agent then trades day by day with continuous decision-making.
 
 =============================================================================
@@ -42,7 +42,7 @@ OBSERVATION SPACE
 Flat float32 vector:
 
   [0]              : current BTC spot (USD)
-  [1]              : day index inside the episode (0..89)
+  [1]              : day index inside the episode (0..149)
   [2:367]          : spot history of LAST 365 days (USD)
 
   [367:...]        : Current tradable options (padded to MAX_OPTIONS)
@@ -82,7 +82,7 @@ from envs.pricing import black_scholes
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-EPISODE_DAYS  = 90        # length of an episode in calendar days
+EPISODE_DAYS  = 150       # length of an episode in calendar days
 SPOT_HISTORY  = 365       # days of past spot shown in observation
 MAX_PORTFOLIO = 10000     # max open positions to track
 
@@ -97,7 +97,7 @@ class OptionsEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self):
+    def __init__(self, init_random_positions=False):
         super().__init__()
 
         # Load all available days from disk
@@ -112,6 +112,9 @@ class OptionsEnv(gym.Env):
         self.MAX_OPTIONS = max_options_per_day()
         if self.MAX_OPTIONS == 0:
             self.MAX_OPTIONS = 500  # fallback
+
+        # Feature flag: initialize episodes with random positions (for testing/evaluation only)
+        self.init_random_positions = init_random_positions
 
         # Episode state
         self.start_day_idx = 0
@@ -129,7 +132,7 @@ class OptionsEnv(gym.Env):
             "action_type": spaces.Discrete(3),
             "call_or_put": spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
             "strike": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
-            "maturity": spaces.Box(low=1, high=90, shape=(1,), dtype=np.float32),
+            "maturity": spaces.Box(low=1, high=150, shape=(1,), dtype=np.float32),
             "quantity_signed": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
             "log_prob": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
         })
@@ -149,7 +152,12 @@ class OptionsEnv(gym.Env):
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
-        """Reset environment to a new episode."""
+        """Reset environment to a new episode.
+        
+        Initializes with random positions to force generalization and avoid
+        overfitting on limited 3-year dataset. Each episode has different
+        starting conditions (0-5 random positions).
+        """
         super().reset(seed=seed)
 
         max_start = len(self.all_days) - EPISODE_DAYS - 1
@@ -169,6 +177,12 @@ class OptionsEnv(gym.Env):
             self.spot_history.append(data["spot"] if data["spot"] is not None else 0.0)
 
         self._load_current_day()
+        
+        # Initialize with random starting positions only if enabled
+        # (For testing/evaluation, not for training)
+        if self.init_random_positions:
+            self._initialize_random_positions()
+        
         return self._get_obs(), {}
 
     # ── Step ──────────────────────────────────────────────────────────────────
@@ -183,9 +197,75 @@ class OptionsEnv(gym.Env):
         self._mark_to_market()
 
         terminated = self.episode_day >= EPISODE_DAYS - 1
-        reward = float(self.realized_pnl) if terminated else 0.0
+        
+        # Reward = realized P&L + unrealized P&L at end of episode
+        # This gives coherent signal on maturity choices (even if beyond episode)
+        if terminated:
+            reward = float(self.realized_pnl) + float(self.unrealized_pnl)
+        else:
+            reward = 0.0
 
         return self._get_obs(), reward, terminated, False, {}
+
+    # ── Random Position Initialization ────────────────────────────────────────
+
+    def _initialize_random_positions(self, prob_position=0.6, max_positions=5):
+        """
+        Initialize episode with random open positions.
+        
+        This forces the agent to learn position management, not just opening.
+        Each episode has 0-max_positions random initial positions with:
+        - Random call/put type
+        - Random strike (moneyness relative to spot)
+        - Random maturity (1-60 days)
+        - Random quantity (long or short, 0.5-2.5 contracts)
+        - Entry price set to current market price (so unrealized P&L = 0 initially)
+        """
+        if self.today_options is None or len(self.today_options) == 0:
+            return
+        
+        num_init_positions = self.np_random.integers(0, max_positions + 1)
+        
+        for _ in range(num_init_positions):
+            # Random option type
+            option_type = "call" if self.np_random.random() > 0.5 else "put"
+            
+            # Random strike (moneyness: -20% to +20% relative to spot)
+            moneyness_factor = self.np_random.uniform(0.8, 1.2)
+            strike_target = self.spot * moneyness_factor
+            
+            # Random maturity (1-180 days) - some positions extend beyond episode
+            maturity_target = self.np_random.integers(1, 181)
+            
+            # Random quantity (0.5-2.5 contracts, can be short)
+            quantity = self.np_random.uniform(0.5, 2.5)
+            if self.np_random.random() > 0.5:
+                quantity = -quantity  # Short position
+            
+            # Find closest matching option
+            match = self._find_closest_option(option_type, strike_target, maturity_target)
+            if match is None:
+                continue
+            
+            option, strike, maturity = match
+            
+            # Create position with entry_price = current price
+            # (so unrealized P&L starts at 0, agent must manage it)
+            position = {
+                "instrument": option["instrument"],
+                "strike": strike,
+                "expiry": option["expiry"],
+                "maturity": maturity,
+                "option_type": option_type,
+                "quantity": abs(quantity),
+                "is_short": quantity < 0,
+                "entry_price": option["price"],
+                "price": option["price"],
+                "iv_last": option["iv"] if option["iv"] > 0 else 50.0,
+                "stale": False,
+            }
+            
+            self.portfolio.append(position)
 
     # ── Day loading ───────────────────────────────────────────────────────────
 
@@ -213,6 +293,12 @@ class OptionsEnv(gym.Env):
 
     # ── Action Execution ────────────────────────────────────────────────────
 
+    def _to_python_scalar(self, x):
+        """Safely convert array or scalar to Python scalar (float/int)."""
+        if hasattr(x, 'item'):  # numpy scalar / array
+            return x.item()
+        return x
+
     def _execute_action(self, action):
         """
         Execute action from GRU-PPO agent.
@@ -221,17 +307,18 @@ class OptionsEnv(gym.Env):
             - "action_type": scalar (0/1/2)
             - "call_or_put": scalar or array in [-1, 1]
             - "strike": scalar or array
-            - "maturity": scalar or array in [1, 90]
+            - "maturity": scalar or array in [1, 150]
             - "quantity_signed": scalar or array
             - "log_prob": scalar or array (ignored)
         """
-        action_type = int(np.atleast_1d(action.get("action_type", 0))[0])
+        action_type = int(self._to_python_scalar(np.atleast_1d(action.get("action_type", 0))[0]))
 
         if action_type == 1:  # Trade
-            call_or_put = float(np.atleast_1d(action.get("call_or_put", 0.5))[0])
-            strike = float(np.atleast_1d(action.get("strike", self.spot))[0])
-            maturity = int(np.clip(np.atleast_1d(action.get("maturity", 30))[0], 1, 90))
-            quantity_signed = float(np.atleast_1d(action.get("quantity_signed", 0.0))[0])
+            call_or_put = float(self._to_python_scalar(np.atleast_1d(action.get("call_or_put", 0.5))[0]))
+            strike = float(self._to_python_scalar(np.atleast_1d(action.get("strike", self.spot))[0]))
+            maturity = int(self._to_python_scalar(np.atleast_1d(action.get("maturity", 30))[0]))
+            maturity = max(1, maturity)  # Allow any maturity (including beyond 150-day episode)
+            quantity_signed = float(self._to_python_scalar(np.atleast_1d(action.get("quantity_signed", 0.0))[0]))
 
             option_type = "call" if call_or_put > 0 else "put"
             self._open_position(option_type, strike, maturity, quantity_signed)
@@ -287,8 +374,8 @@ class OptionsEnv(gym.Env):
             "option_type": option_type,
             "quantity": abs(quantity_signed),
             "is_short": quantity_signed < 0,
-            "entry_price": option["mid_price"],
-            "price": option["mid_price"],
+            "entry_price": option["price"],
+            "price": option["price"],
             "iv_last": option["iv"] if option["iv"] > 0 else 50.0,
             "stale": False,
         }
