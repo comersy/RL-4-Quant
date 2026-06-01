@@ -1,73 +1,69 @@
 """
-RL environment for BTC options trading on real data.
+RL environment for BTC options trading on real Deribit data.
 
 =============================================================================
 OVERVIEW
 =============================================================================
 Each episode lasts 90 calendar days. The agent starts at a random day in the
 dataset, with at least 365 days of past spot history behind and 90 days of
-data ahead. The agent then trades day by day.
+data ahead. The agent then trades day by day with continuous decision-making.
 
-At each step the agent can place up to MAX_TRADES trades from the options
-actually traded that day on Deribit. The data is real historical data
-downloaded via data/download.py.
+=============================================================================
+ACTION SPACE (from train.py / README)
+=============================================================================
+At each step, the agent outputs a single hierarchical action:
 
------------------------------------------------------------------------------
+{
+  "action_type": int ∈ {0, 1, 2}
+    0 = do nothing
+    1 = place new trade (use call_or_put, strike, maturity, quantity_signed)
+    2 = close a position
+
+  "call_or_put": float ∈ [-1, 1]
+    Rescale to [0, 1]: 0 = CALL, 1 = PUT
+
+  "strike": float (unbounded)
+    Moneyness relative to spot. The environment finds the closest available
+    option that matches this strike.
+
+  "maturity": int ∈ [1, T_remaining]
+    Days to expiry. Environment finds the closest option with this maturity.
+
+  "quantity_signed": float (unbounded)
+    Absolute value = number of contracts
+    Sign: positive = LONG (buy), negative = SHORT (sell)
+
+  "log_prob": float (for PPO training, ignored by env)
+}
+
+=============================================================================
 OBSERVATION SPACE
------------------------------------------------------------------------------
+=============================================================================
 Flat float32 vector:
 
-  Market info:
-    [0]              : current BTC spot (USD)
-    [1]              : day index inside the episode (0..89)
-    [2 : 367]        : spot history of the LAST 365 days (USD)
-                        (episode always starts after at least 365 days of data)
+  [0]              : current BTC spot (USD)
+  [1]              : day index inside the episode (0..89)
+  [2:367]          : spot history of LAST 365 days (USD)
 
-  Option grid (today's tradable options, padded to self.MAX_OPTIONS):
-    per option: [option_type, strike, days_to_expiry, price_btc, iv, volume]
-    -> shape: (self.MAX_OPTIONS x 6,)
-    Empty slots filled with zeros.
+  [367:...]        : Current tradable options (padded to MAX_OPTIONS)
+                     Per option: [call=1/put=0, strike, days_to_expiry,
+                                  price_btc, iv, volume]
 
-  Portfolio (up to MAX_PORTFOLIO open positions):
-    per position: [option_type, strike, days_to_expiry, quantity, is_short,
-                   entry_price, current_price, unrealized_pnl]
-    -> shape: (MAX_PORTFOLIO x 8,)
+  [...+MAX_PORTFOLIO*8]:
+                     Current open positions (padded to MAX_PORTFOLIO)
+                     Per position: [call=1/put=0, strike, days_to_expiry,
+                                    quantity, is_short, entry_price,
+                                    current_price, unrealized_pnl]
 
-  Scalar state:
-    realized_pnl, unrealized_pnl
+  [-2]             : realized P&L (USD)
+  [-1]             : unrealized P&L (USD)
 
------------------------------------------------------------------------------
-ACTION SPACE
------------------------------------------------------------------------------
-The agent outputs MAX_TRADES slots. Each slot is:
-
-  [type_action, option_index, quantite, close_index]
-
-  type_action  : Discrete(4)
-    0 = do nothing
-    1 = buy   (uses option_index, quantite)
-    2 = sell  (uses option_index, quantite)
-    3 = close (uses close_index)
-
-  option_index : Discrete(self.MAX_OPTIONS)  - index in today's option list
-  quantite     : Discrete(MAX_QTY)           - contracts, >= 1
-  close_index  : Discrete(MAX_PORTFOLIO)
-
------------------------------------------------------------------------------
+=============================================================================
 REWARD
------------------------------------------------------------------------------
-Reward = 0 every day except on the final day (day 89) where it equals the
-total realized P&L of the episode.
+=============================================================================
+Reward is 0 every day, except on the final day (day 89) where it equals the
+total realized P&L from all trades during the episode.
 
------------------------------------------------------------------------------
-PRICING
------------------------------------------------------------------------------
-- All transactions (buy / sell / close) use the option's "price" field
-  (last trade of the day in BTC).
-- Mark-to-market uses today's price if the option traded that day, otherwise
-  Black-Scholes fallback with last known IV.
-- Expired options settle at intrinsic payoff: max(S-K, 0) for calls,
-  max(K-S, 0) for puts (paid in BTC).
 =============================================================================
 """
 
@@ -80,27 +76,31 @@ import gymnasium as gym
 from gymnasium import spaces
 from datetime import datetime
 
-from data.loader   import list_available_days, load_day, max_options_per_day
-from envs.pricing  import black_scholes
+from data.loader import list_available_days, load_day, max_options_per_day
+from envs.pricing import black_scholes
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 EPISODE_DAYS  = 90        # length of an episode in calendar days
 SPOT_HISTORY  = 365       # days of past spot shown in observation
-MAX_PORTFOLIO = 10000     # max open positions
-MAX_QTY       = 100       # max contracts per trade
-MAX_TRADES    = 500       # max trades per step
+MAX_PORTFOLIO = 10000     # max open positions to track
 
 
 class OptionsEnv(gym.Env):
+    """
+    Options trading environment with continuous hierarchical action space.
+    
+    The agent receives continuous parameters (strike, maturity, quantity_signed)
+    and the environment matches them to actual available options.
+    """
 
     metadata = {"render_modes": []}
 
     def __init__(self):
         super().__init__()
 
-        # load all available days from disk
+        # Load all available days from disk
         self.all_days = list_available_days()
         if len(self.all_days) < EPISODE_DAYS + SPOT_HISTORY:
             raise ValueError(
@@ -108,34 +108,39 @@ class OptionsEnv(gym.Env):
                 f"got {len(self.all_days)}"
             )
 
-        # episode state (set by reset)
-        self.start_day_idx   = 0
+        # Get max options from data
+        self.MAX_OPTIONS = max_options_per_day()
+        if self.MAX_OPTIONS == 0:
+            self.MAX_OPTIONS = 500  # fallback
+
+        # Episode state
+        self.start_day_idx = 0
         self.current_day_idx = 0
-        self.episode_day     = 0
-        self.current_data    = None
-        self.spot_history    = []
-        self.portfolio       = []
-        self.realized_pnl    = 0.0
-        self.unrealized_pnl  = 0.0
-        self.today_options   = []
-        self.MAX_OPTIONS     = max_options_per_day()   # computed from data
+        self.episode_day = 0
+        self.current_data = None
+        self.spot_history = []
+        self.portfolio = []
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
+        self.today_options = []
 
-        # action space
-        single_trade = spaces.Dict({
-            "type_action":  spaces.Discrete(4),
-            "option_index": spaces.Discrete(self.MAX_OPTIONS),
-            "quantite":     spaces.Discrete(MAX_QTY),
-            "close_index":  spaces.Discrete(MAX_PORTFOLIO),
+        # Action space: continuous dict matching train.py
+        self.action_space = spaces.Dict({
+            "action_type": spaces.Discrete(3),
+            "call_or_put": spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32),
+            "strike": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            "maturity": spaces.Box(low=1, high=90, shape=(1,), dtype=np.float32),
+            "quantity_signed": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            "log_prob": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
         })
-        self.action_space = spaces.Tuple(tuple(single_trade for _ in range(MAX_TRADES)))
 
-        # observation space (flat float32 vector)
+        # Observation space
         obs_size = (
             2                            # spot, episode_day
-            + SPOT_HISTORY               # past spots
+            + SPOT_HISTORY               # historical spot prices
             + self.MAX_OPTIONS * 6       # tradable options
-            + MAX_PORTFOLIO * 8          # portfolio
-            + 2                          # realized + unrealized pnl
+            + MAX_PORTFOLIO * 8          # open positions
+            + 2                          # realized + unrealized P&L
         )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
@@ -144,18 +149,20 @@ class OptionsEnv(gym.Env):
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(self, seed=None, options=None):
+        """Reset environment to a new episode."""
         super().reset(seed=seed)
 
         max_start = len(self.all_days) - EPISODE_DAYS - 1
         min_start = SPOT_HISTORY
-        self.start_day_idx   = int(self.np_random.integers(min_start, max_start + 1))
+        self.start_day_idx = int(self.np_random.integers(min_start, max_start + 1))
         self.current_day_idx = self.start_day_idx
-        self.episode_day     = 0
+        self.episode_day = 0
 
-        self.portfolio      = []
-        self.realized_pnl   = 0.0
+        self.portfolio = []
+        self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
 
+        # Load spot history
         self.spot_history = []
         for i in range(self.start_day_idx - SPOT_HISTORY, self.start_day_idx):
             data = load_day(self.all_days[i])
@@ -167,17 +174,18 @@ class OptionsEnv(gym.Env):
     # ── Step ──────────────────────────────────────────────────────────────────
 
     def step(self, action):
-        for slot in action:
-            self._execute_trade(slot)
+        """Execute one trading day."""
+        self._execute_action(action)
 
         self.current_day_idx += 1
-        self.episode_day     += 1
+        self.episode_day += 1
         self._load_current_day()
         self._mark_to_market()
 
         terminated = self.episode_day >= EPISODE_DAYS - 1
-        reward     = self.realized_pnl if terminated else 0.0
-        return self._get_obs(), float(reward), terminated, False, {}
+        reward = float(self.realized_pnl) if terminated else 0.0
+
+        return self._get_obs(), reward, terminated, False, {}
 
     # ── Day loading ───────────────────────────────────────────────────────────
 
@@ -195,54 +203,131 @@ class OptionsEnv(gym.Env):
             if o["expiry"].date() > today.date()
         ]
 
-    # ── Trades ────────────────────────────────────────────────────────────────
+    @property
+    def spot(self):
+        """Get current BTC spot price."""
+        if self.current_data and self.current_data["spot"] is not None:
+            return self.current_data["spot"]
+        return self.spot_history[-1] if self.spot_history else 0.0
 
-    def _execute_trade(self, slot: dict):
-        t = int(slot["type_action"])
-        if t == 0:
+
+    # ── Action Execution ────────────────────────────────────────────────────
+
+    def _execute_action(self, action):
+        """
+        Execute action from GRU-PPO agent.
+        
+        action: dict with keys:
+            - "action_type": scalar (0/1/2)
+            - "call_or_put": scalar or array in [-1, 1]
+            - "strike": scalar or array
+            - "maturity": scalar or array in [1, 90]
+            - "quantity_signed": scalar or array
+            - "log_prob": scalar or array (ignored)
+        """
+        action_type = int(np.atleast_1d(action.get("action_type", 0))[0])
+
+        if action_type == 1:  # Trade
+            call_or_put = float(np.atleast_1d(action.get("call_or_put", 0.5))[0])
+            strike = float(np.atleast_1d(action.get("strike", self.spot))[0])
+            maturity = int(np.clip(np.atleast_1d(action.get("maturity", 30))[0], 1, 90))
+            quantity_signed = float(np.atleast_1d(action.get("quantity_signed", 0.0))[0])
+
+            option_type = "call" if call_or_put > 0 else "put"
+            self._open_position(option_type, strike, maturity, quantity_signed)
+
+        elif action_type == 2:  # Close position
+            self._close_position_by_maturity()
+
+
+    # ── Option Matching ────────────────────────────────────────────────────
+
+    def _find_closest_option(self, option_type, strike_target, maturity_target):
+        """
+        Find closest option to target strike and maturity from today_options.
+        
+        Returns: (option, strike, maturity) or None if no options available.
+        """
+        candidates = [
+            opt for opt in self.today_options
+            if opt["option_type"] == option_type
+        ]
+
+        if not candidates:
+            return None
+
+        day_today = datetime.strptime(self.all_days[self.current_day_idx], "%Y-%m-%d")
+
+        def score(opt):
+            strike_dist = abs(opt["strike"] - strike_target) / (self.spot + 1e-8)
+            maturity_dist = abs((opt["expiry"] - day_today).days - maturity_target) / 90.0
+            return strike_dist + maturity_dist
+
+        best_opt = min(candidates, key=score)
+        return (best_opt, best_opt["strike"], (best_opt["expiry"] - day_today).days)
+
+    # ── Position Management ────────────────────────────────────────────────
+
+    def _open_position(self, option_type, strike_target, maturity_target, quantity_signed):
+        """Open a new position or add to existing one."""
+        if quantity_signed == 0.0:
             return
 
-        if t == 3:
-            idx = int(slot["close_index"])
-            if idx < len(self.portfolio):
-                self._close(idx)
+        match = self._find_closest_option(option_type, strike_target, maturity_target)
+        if match is None:
             return
 
-        opt_idx = int(slot["option_index"])
-        if opt_idx >= len(self.today_options):
-            return
-        opt = self.today_options[opt_idx]
+        option, strike, maturity = match
 
-        qty        = max(1, int(slot["quantite"]))
-        side_short = (t == 2)
-        price      = opt["price"]
+        position = {
+            "instrument": option["instrument"],
+            "strike": strike,
+            "expiry": option["expiry"],
+            "maturity": maturity,
+            "option_type": option_type,
+            "quantity": abs(quantity_signed),
+            "is_short": quantity_signed < 0,
+            "entry_price": option["mid_price"],
+            "price": option["mid_price"],
+            "iv_last": option["iv"] if option["iv"] > 0 else 50.0,
+            "stale": False,
+        }
 
-        if side_short:
-            self.realized_pnl += price * qty
+        self.portfolio.append(position)
+
+    def _close_position_by_maturity(self):
+        """Close oldest positions by maturity."""
+        day_today = datetime.strptime(self.all_days[self.current_day_idx], "%Y-%m-%d")
+        
+        remaining = []
+        for p in self.portfolio:
+            if p["expiry"] <= day_today:
+                self._realize_pnl(p)
+            else:
+                remaining.append(p)
+        
+        self.portfolio = remaining
+
+    def _realize_pnl(self, position):
+        """Realize profit/loss for a closed position."""
+        entry = position["entry_price"]
+        quantity = position["quantity"]
+        
+        spot = self.current_data["spot"] if self.current_data["spot"] is not None else self.spot_history[-1]
+        
+        # Intrinsic value at expiry
+        strike = position["strike"]
+        if position["option_type"] == "call":
+            payoff = max(spot - strike, 0.0)
         else:
-            self.realized_pnl -= price * qty
-
-        self.portfolio.append({
-            "instrument":  opt["instrument"],
-            "strike":      opt["strike"],
-            "expiry":      opt["expiry"],
-            "option_type": opt["option_type"],
-            "quantity":    qty,
-            "is_short":    side_short,
-            "entry_price": price,
-            "price":       price,
-            "iv_last":     opt["iv"] if opt["iv"] > 0 else 50.0,
-            "stale":       False,
-        })
-
-    def _close(self, idx: int):
-        p     = self.portfolio[idx]
-        price = p["price"]
-        if p["is_short"]:
-            self.realized_pnl -= price * p["quantity"]
+            payoff = max(strike - spot, 0.0)
+        
+        if position["is_short"]:
+            pnl = (entry - payoff) * quantity
         else:
-            self.realized_pnl += price * p["quantity"]
-        self.portfolio.pop(idx)
+            pnl = (payoff - entry) * quantity
+        
+        self.realized_pnl += pnl
 
     # ── Mark to market ────────────────────────────────────────────────────────
 
