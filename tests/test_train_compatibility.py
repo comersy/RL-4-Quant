@@ -1,7 +1,7 @@
 import numpy as np
 
 from envs.env import OptionsEnv
-from RL_model.train import CONFIG, GRUPPOAgent
+from RL_model.train import CONFIG, GRUPPOAgent, build_env_and_agent
 
 
 EXPECTED_ACTION_KEYS = {
@@ -69,3 +69,11 @@ def test_agent_accepts_flat_numpy_observation():
     action, _, _ = agent.get_action(obs)
 
     assert set(action) == EXPECTED_ACTION_KEYS
+
+
+def test_default_training_components_are_wired_to_options_env():
+    env, agent, config = build_env_and_agent(config=tiny_config(), init_random_positions=False)
+
+    assert isinstance(env, OptionsEnv)
+    assert agent.obs_dim == env.observation_space.shape[0]
+    assert config["episode_length"] <= 150

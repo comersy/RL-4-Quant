@@ -61,7 +61,7 @@ Flat float32 vector:
 =============================================================================
 REWARD
 =============================================================================
-Reward is 0 every day, except on the final day (day 89) where it equals the
+Reward is 0 every day, except on the final day (day ) where it equals the
 total realized P&L from all trades during the episode.
 
 =============================================================================

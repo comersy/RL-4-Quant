@@ -14,6 +14,7 @@ The action space is hierarchical:
     - quantity_signed: continuous (positive=long/buy, negative=short/sell)
 """
 
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -23,25 +24,28 @@ from torch.distributions import Normal, Categorical
 from collections import deque, namedtuple
 import os
 from pathlib import Path
+from envs.env import EPISODE_DAYS, OptionsEnv
 
 # ============================================================================
 # Configuration
 # ============================================================================
+
+NUM_EPISODES = 100_000
 
 CONFIG = {
     "gru_hidden_size": 256,
     "encoder_hidden_sizes": [256, 128],
     "actor_hidden_sizes": [128, 64],
     "critic_hidden_sizes": [128, 64],
-    "learning_rate": 3e-4,
+    "learning_rate": 2e-4,
     "gamma": 0.99,  # discount factor
     "gae_lambda": 0.95,  # GAE lambda
     "ppo_epochs": 4,  # number of PPO epochs per update
-    "ppo_clip": 0.2,  # PPO clipping coefficient
-    "batch_size": 32,  # episode batch size for update
-    "buffer_capacity": 100,  # number of episodes to store
-    "episode_length": 252,
-    "entropy_coef": 0.01,  # entropy regularization
+    "ppo_clip": 0.15,  # PPO clipping coefficient
+    "batch_size": 256,  # episode batch size for update
+    "buffer_capacity": 300,  # number of episodes to store
+    "episode_length": 150,
+    "entropy_coef": 0.07,  # entropy regularization
     "vf_coef": 0.5,  # value function loss coefficient
     "max_grad_norm": 0.5,  # gradient clipping
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -408,9 +412,9 @@ class GRUPPOAgent:
                 for t_idx, transition in enumerate(episode.transitions):
                     obs = torch.FloatTensor(transition.observation).unsqueeze(0).to(self.device)
                     reward = torch.FloatTensor([transition.reward]).to(self.device)
-                    old_log_prob = torch.FloatTensor([transition.old_log_prob]).to(self.device)
+                    old_log_prob = torch.FloatTensor([_as_scalar(transition.old_log_prob)]).to(self.device)
                     advantage = torch.FloatTensor([episode.advantages[t_idx]]).to(self.device)
-                    ret = torch.FloatTensor([episode.returns[t_idx]]).to(self.device)
+                    ret = torch.FloatTensor([[episode.returns[t_idx]]]).to(self.device)
 
                     # Forward pass:
                     # 1. Encode observation
@@ -600,7 +604,7 @@ def _log_scalars(writer, metrics, step):
         writer.add_scalar(name, value, step)
 
 
-def train(env, agent, config, num_episodes=10, writer=None):
+def train(env, agent, config, num_episodes=NUM_EPISODES, writer=None):
     """
     Main PPO training loop
 
@@ -656,7 +660,6 @@ def train(env, agent, config, num_episodes=10, writer=None):
 
                 obs = obs_next
                 env_step = episode_num * config["episode_length"] + step + 1
-                _log_scalars(writer, _portfolio_metrics(env), env_step)
 
                 if done or truncated:
                     break
@@ -680,14 +683,21 @@ def train(env, agent, config, num_episodes=10, writer=None):
                 f"Steps: {len(episode_transitions)} | Reward: {episode_reward:.2f}"
             )
 
+            episode_metrics = _portfolio_metrics(env)
+            _log_scalars(writer, episode_metrics, global_step)
+
             if writer is not None:
+                final_metrics = _portfolio_metrics(env)
                 writer.add_scalar("episode/reward", episode_reward, global_step)
                 writer.add_scalar("episode/steps", len(episode_transitions), global_step)
-                writer.add_scalar("episode/hold_actions", action_counts["hold"], global_step)
-                writer.add_scalar("episode/trade_actions", action_counts["trade"], global_step)
-                writer.add_scalar("episode/close_actions", action_counts["close"], global_step)
-                writer.add_scalar("buffer/size", len(buffer), global_step)
-                _log_scalars(writer, _portfolio_metrics(env), global_step)
+
+                writer.add_scalar("episode/pnl_total", final_metrics["pnl/total"], global_step)
+                writer.add_scalar("episode/pnl_realized", final_metrics["pnl/realized"], global_step)
+                writer.add_scalar("episode/pnl_unrealized", final_metrics["pnl/unrealized"], global_step)
+
+                writer.add_scalar("episode/num_positions", final_metrics["portfolio/open_positions"], global_step)
+                writer.add_scalar("episode/long_positions", final_metrics["portfolio/long_positions"], global_step)
+                writer.add_scalar("episode/short_positions", final_metrics["portfolio/short_positions"], global_step)
 
             # Train on batch of episodes if buffer is full
             if len(buffer) >= config["batch_size"]:
@@ -708,13 +718,89 @@ def train(env, agent, config, num_episodes=10, writer=None):
     return agent, buffer
 
 
-if __name__ == "__main__":
+def build_env_and_agent(config=None, init_random_positions=False):
+    """Build the default project environment and matching GRU-PPO agent."""
+
+
+    run_config = (config or CONFIG).copy()
+    run_config["episode_length"] = min(run_config["episode_length"], EPISODE_DAYS)
+
+    env = OptionsEnv(init_random_positions=init_random_positions)
+    agent = GRUPPOAgent(obs_dim=env.observation_space.shape[0], config=run_config)
+    return env, agent, run_config
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Train GRU-PPO on OptionsEnv.")
+    parser.add_argument("--episodes", type=int, default=NUM_EPISODES, help="Number of episodes to train.")
+    parser.add_argument(
+        "--log-dir",
+        default=CONFIG["tensorboard_log_dir"],
+        help="TensorBoard log directory.",
+    )
+    parser.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="Disable TensorBoard logging.",
+    )
+    parser.add_argument(
+        "--save-path",
+        default=None,
+        help="Optional path for saving the trained agent checkpoint.",
+    )
+    parser.add_argument(
+        "--init-random-positions",
+        action="store_true",
+        help="Start episodes with random positions. Useful for evaluation/stress tests.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Use a tiny model and two environment steps to verify wiring quickly.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    run_config = CONFIG.copy()
+    run_config["tensorboard_log_dir"] = None if args.no_tensorboard else args.log_dir
+
+    if args.smoke_test:
+        run_config.update(
+            {
+                "encoder_hidden_sizes": [32, 16],
+                "gru_hidden_size": 16,
+                "actor_hidden_sizes": [16],
+                "critic_hidden_sizes": [16],
+                "episode_length": 2,
+                "batch_size": 1,
+                "buffer_capacity": 2,
+                "ppo_epochs": 1,
+                "tensorboard_log_dir": None,
+            }
+        )
+
+    env, agent, run_config = build_env_and_agent(
+        config=run_config,
+        init_random_positions=args.init_random_positions,
+    )
+
     print("GRU-PPO Training Script Initialized")
-    print(f"Configuration: {CONFIG}")
-    print("\nTo start training, import this module and use the train() function with your environment.")
-    print("\nExample:")
-    print("  from RL_model.train import GRUPPOAgent, train")
-    print("  from envs.env import YourEnvironment")
-    print("  env = YourEnvironment()")
-    print("  agent = GRUPPOAgent(obs_dim=env.observation_space.shape[0], config=CONFIG)")
-    print("  agent, buffer = train(env, agent, CONFIG, num_episodes=100)")
+    print(f"Observation dim: {env.observation_space.shape[0]}")
+    print(f"Episode length: {run_config['episode_length']}")
+    print(f"TensorBoard log dir: {run_config['tensorboard_log_dir']}")
+    print(f"Training episodes: {args.episodes}")
+
+    agent, buffer = train(env, agent, run_config, num_episodes=args.episodes)
+
+    if args.save_path:
+        Path(args.save_path).parent.mkdir(parents=True, exist_ok=True)
+        agent.save(args.save_path)
+        print(f"Saved checkpoint to {args.save_path}")
+
+    return agent, buffer
+
+
+if __name__ == "__main__":
+    main()

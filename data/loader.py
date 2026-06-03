@@ -15,14 +15,14 @@ For each day, returns:
         }
 """
 
-import os
 import csv
 import json
 import re
 from datetime import datetime
+from pathlib import Path
 
 
-RAW_DIR = "data/raw"
+RAW_DIR = Path(__file__).resolve().parent / "raw"
 
 MONTHS = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4,  "MAY": 5,  "JUN": 6,
@@ -46,10 +46,9 @@ def parse_instrument(name: str) -> dict | None:
 
 def list_available_days() -> list[str]:
     """Return all dates available in data/raw/, sorted ascending."""
-    if not os.path.exists(RAW_DIR):
+    if not RAW_DIR.exists():
         return []
-    return sorted(d for d in os.listdir(RAW_DIR)
-                  if os.path.isdir(os.path.join(RAW_DIR, d)))
+    return sorted(d.name for d in RAW_DIR.iterdir() if d.is_dir())
 
 
 def load_day(date_str: str) -> dict:
@@ -68,9 +67,9 @@ def load_day(date_str: str) -> dict:
         "options": list of option dicts
     }
     """
-    day_dir   = os.path.join(RAW_DIR, date_str)
-    meta_path = os.path.join(day_dir, "meta.json")
-    csv_path  = os.path.join(day_dir, "trades.csv")
+    day_dir = RAW_DIR / date_str
+    meta_path = day_dir / "meta.json"
+    csv_path = day_dir / "trades.csv"
 
     with open(meta_path) as f:
         meta = json.load(f)
