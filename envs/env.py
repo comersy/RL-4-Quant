@@ -84,7 +84,7 @@ from envs.pricing import black_scholes
 
 EPISODE_DAYS  = 150       # length of an episode in calendar days
 SPOT_HISTORY  = 365       # days of past spot shown in observation
-MAX_PORTFOLIO = 10000     # max open positions to track
+MAX_PORTFOLIO = 100     # max open positions to track
 
 
 class OptionsEnv(gym.Env):

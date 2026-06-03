@@ -45,6 +45,7 @@ CONFIG = {
     "vf_coef": 0.5,  # value function loss coefficient
     "max_grad_norm": 0.5,  # gradient clipping
     "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "tensorboard_log_dir": "runs/gru_ppo",
 }
 
 print(f"Using device: {CONFIG['device']}")
@@ -73,8 +74,9 @@ class EpisodeBuffer:
     def sample(self, batch_size):
         """Sample random complete episodes"""
         episodes = list(self.buffer)
-        batch = np.random.choice(episodes, size=min(batch_size, len(episodes)), replace=False)
-        return batch
+        sample_size = min(batch_size, len(episodes))
+        indices = np.random.choice(len(episodes), size=sample_size, replace=False)
+        return [episodes[i] for i in indices]
 
     def __len__(self):
         return len(self.buffer)
@@ -539,7 +541,66 @@ def compute_gae(rewards, values, dones, gamma, gae_lambda):
     return advantages, returns
 
 
-def train(env, agent, config, num_episodes=10):
+def _make_tensorboard_writer(config):
+    """Create a TensorBoard writer when tensorboard_log_dir is configured."""
+    log_dir = config.get("tensorboard_log_dir")
+    if not log_dir:
+        return None
+
+    from torch.utils.tensorboard import SummaryWriter
+
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(log_dir))
+
+
+def _as_scalar(value, default=0.0):
+    """Convert tensors/arrays/scalars into a Python float for logging."""
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        if hasattr(value, "item"):
+            value = value.item()
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _action_type(action_dict):
+    return int(_as_scalar(np.atleast_1d(action_dict.get("action_type", 0))[0]))
+
+
+def _portfolio_metrics(env):
+    realized_pnl = _as_scalar(getattr(env, "realized_pnl", 0.0))
+    unrealized_pnl = _as_scalar(getattr(env, "unrealized_pnl", 0.0))
+    portfolio = getattr(env, "portfolio", [])
+    num_positions = len(portfolio) if portfolio is not None else 0
+
+    num_long = 0
+    num_short = 0
+    for position in portfolio or []:
+        if position.get("is_short", False):
+            num_short += 1
+        else:
+            num_long += 1
+
+    return {
+        "pnl/realized": realized_pnl,
+        "pnl/unrealized": unrealized_pnl,
+        "pnl/total": realized_pnl + unrealized_pnl,
+        "portfolio/open_positions": num_positions,
+        "portfolio/long_positions": num_long,
+        "portfolio/short_positions": num_short,
+    }
+
+
+def _log_scalars(writer, metrics, step):
+    if writer is None:
+        return
+    for name, value in metrics.items():
+        writer.add_scalar(name, value, step)
+
+
+def train(env, agent, config, num_episodes=10, writer=None):
     """
     Main PPO training loop
 
@@ -549,65 +610,100 @@ def train(env, agent, config, num_episodes=10):
     num_episodes: number of episodes to train
     """
     buffer = EpisodeBuffer(config["buffer_capacity"])
+    owns_writer = writer is None
+    writer = writer or _make_tensorboard_writer(config)
 
-    for episode_num in range(num_episodes):
-        obs, info = env.reset()
-        episode_transitions = []
-        episode_rewards = []
-        episode_values = []
-        episode_dones = []
+    try:
+        for episode_num in range(num_episodes):
+            obs, info = env.reset()
+            episode_transitions = []
+            episode_rewards = []
+            episode_values = []
+            episode_dones = []
 
-        h_gru = None
-        episode_reward = 0.0
+            h_gru = None
+            episode_reward = 0.0
+            action_counts = {"hold": 0, "trade": 0, "close": 0}
 
-        for step in range(config["episode_length"]):
-            # Get action and value from agent
-            action_dict, h_gru, value = agent.get_action(obs, h_gru)
+            for step in range(config["episode_length"]):
+                # Get action and value from agent
+                action_dict, h_gru, value = agent.get_action(obs, h_gru)
+                action_type = _action_type(action_dict)
+                if action_type == 1:
+                    action_counts["trade"] += 1
+                elif action_type == 2:
+                    action_counts["close"] += 1
+                else:
+                    action_counts["hold"] += 1
 
-            # Step environment
-            obs_next, reward, done, truncated, info = env.step(action_dict)
+                # Step environment
+                obs_next, reward, done, truncated, info = env.step(action_dict)
 
-            episode_reward += reward
-            episode_rewards.append(reward)
-            episode_values.append(value)
-            episode_dones.append(done or truncated)
+                episode_reward += reward
+                episode_rewards.append(reward)
+                episode_values.append(value)
+                episode_dones.append(done or truncated)
 
-            # Store transition with old log prob
-            episode_transitions.append(Transition(
-                obs,
-                action_dict,
-                reward,
-                done or truncated,
-                value,
-                action_dict["log_prob"]  # store log_prob as numpy
-            ))
+                # Store transition with old log prob
+                episode_transitions.append(Transition(
+                    obs,
+                    action_dict,
+                    reward,
+                    done or truncated,
+                    value,
+                    action_dict["log_prob"]  # store log_prob as numpy
+                ))
 
-            obs = obs_next
+                obs = obs_next
+                env_step = episode_num * config["episode_length"] + step + 1
+                _log_scalars(writer, _portfolio_metrics(env), env_step)
 
-            if done or truncated:
-                break
+                if done or truncated:
+                    break
 
-        # Compute advantages and returns using GAE
-        advantages, returns = compute_gae(
-            episode_rewards,
-            episode_values,
-            episode_dones,
-            config["gamma"],
-            config["gae_lambda"]
-        )
+            # Compute advantages and returns using GAE
+            advantages, returns = compute_gae(
+                episode_rewards,
+                episode_values,
+                episode_dones,
+                config["gamma"],
+                config["gae_lambda"]
+            )
 
-        # Create episode with advantages and returns
-        episode = Episode(episode_transitions, returns.tolist(), advantages.tolist())
-        buffer.push(episode)
+            # Create episode with advantages and returns
+            episode = Episode(episode_transitions, returns.tolist(), advantages.tolist())
+            buffer.push(episode)
 
-        print(f"Episode {episode_num + 1}/{num_episodes} | Steps: {len(episode_transitions)} | Reward: {episode_reward:.2f}")
+            global_step = episode_num + 1
+            print(
+                f"Episode {global_step}/{num_episodes} | "
+                f"Steps: {len(episode_transitions)} | Reward: {episode_reward:.2f}"
+            )
 
-        # Train on batch of episodes if buffer is full
-        if len(buffer) >= config["batch_size"]:
-            episodes_batch = buffer.sample(config["batch_size"])
-            metrics = agent.train_step(episodes_batch, config)
-            if metrics:
-                print(f"  Training metrics: {metrics}")
+            if writer is not None:
+                writer.add_scalar("episode/reward", episode_reward, global_step)
+                writer.add_scalar("episode/steps", len(episode_transitions), global_step)
+                writer.add_scalar("episode/hold_actions", action_counts["hold"], global_step)
+                writer.add_scalar("episode/trade_actions", action_counts["trade"], global_step)
+                writer.add_scalar("episode/close_actions", action_counts["close"], global_step)
+                writer.add_scalar("buffer/size", len(buffer), global_step)
+                _log_scalars(writer, _portfolio_metrics(env), global_step)
+
+            # Train on batch of episodes if buffer is full
+            if len(buffer) >= config["batch_size"]:
+                episodes_batch = buffer.sample(config["batch_size"])
+                metrics = agent.train_step(episodes_batch, config)
+                if metrics:
+                    print(f"  Training metrics: {metrics}")
+                    if writer is not None:
+                        for name, value in metrics.items():
+                            writer.add_scalar(f"loss/{name}", value, global_step)
+
+            if writer is not None:
+                writer.flush()
+    finally:
+        if owns_writer and writer is not None:
+            writer.close()
 
     return agent, buffer
 
