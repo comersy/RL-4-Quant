@@ -405,6 +405,8 @@ class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les opt
                 if len(episode.transitions) == 0:
                     continue
 
+                h_gru = None #h_gru Initialization at each episode
+
                 for t_idx, transition in enumerate(episode.transitions):
                     obs = torch.FloatTensor(transition.observation).unsqueeze(0).to(self.device)
                     reward = torch.FloatTensor([transition.reward]).to(self.device)
@@ -417,7 +419,8 @@ class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les opt
                     encoded = self.encoder(obs)
                     
                     # 2. GRU with learned decay (α_t is computed and used internally)
-                    h_gru, alpha_t = self.gru(encoded)
+                    h_gru, alpha_t = self.gru(encoded, h_gru) #Calcul of the new h_gru
+                    h_gru = h_gru.detach() #detach to not backward every days but just the last one
                     
                     # 3. Actor outputs action distribution
                     action_dict = self.actor(h_gru)
