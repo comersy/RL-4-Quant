@@ -8,7 +8,7 @@ PPO handles mixed discrete/continuous actions naturally without the complexity o
 The action space is hierarchical:
   - Primary action (actor outputs 3 logits): 0 = do nothing, 1 = trade, 2 = close positions
   - If trading (action = 1):
-    - call_or_put: continuous [0-1] → rounded to 0 (call) or 1 (put)
+    - call_or_put: binary : 0 (call) or 1 (put)
     - strike: continuous (unbounded, relative to spot)
     - maturity: discrete [1, T_remaining]
     - quantity_signed: continuous (positive=long/buy, negative=short/sell)
@@ -179,7 +179,7 @@ class ActorNetwork(nn.Module):
     """
     Actor outputs all action distribution parameters:
     - action_type: 3 logits (do nothing, trade, close positions)
-    - call_or_put: continuous [0-1]
+    - call_or_put: binary [0, 1]
     - strike: continuous (unbounded)
     - maturity: logits for Categorical [1, T]
     - quantity_signed: continuous (unbounded, negative=short/sell, positive=long/buy)
@@ -202,9 +202,7 @@ class ActorNetwork(nn.Module):
         self.action_type_logits = nn.Linear(prev_size, 3)
 
         # Call or put
-        self.call_or_put_mu = nn.Linear(prev_size, 1) #Bizarre de vouloir faire une distribution de call/put: choix binaire, il faudrait plutot Categorical(logits, 2) apres avoir juste nn.Linear(prev_size, 2)
-        self.call_or_put_sigma = nn.Linear(prev_size, 1)
-
+        self.call_or_put = nn.Linear(prev_size, 2) 
         # Strike
         self.strike_mu = nn.Linear(prev_size, 1)
         self.strike_sigma = nn.Linear(prev_size, 1)
@@ -229,14 +227,12 @@ class ActorNetwork(nn.Module):
         action_type_dist = Categorical(logits=action_type_logits)
         action_type = action_type_dist.sample()
         log_prob_action_type = action_type_dist.log_prob(action_type)
+        call_or_put_logits = self.call_or_put(x)
+        call_or_put_dist = Categorical(logits=call_or_put_logits)
+        call_or_put = call_or_put_dist.sample()
+        log_prob_call_or_put = call_or_put_dist.log_prob(call_or_put)
 
         # Continuous actions (Normal distributions)
-        call_or_put_mu = torch.tanh(self.call_or_put_mu(x))
-        call_or_put_sigma = F.softplus(self.call_or_put_sigma(x)) + 0.01
-        call_or_put_dist = Normal(call_or_put_mu, call_or_put_sigma)
-        call_or_put = torch.tanh(call_or_put_dist.rsample())
-        log_prob_call_or_put = call_or_put_dist.log_prob(call_or_put).sum(dim=-1)
-
         strike_mu = self.strike_mu(x)
         strike_sigma = F.softplus(self.strike_sigma(x)) + 0.01
         strike_dist = Normal(strike_mu, strike_sigma)
