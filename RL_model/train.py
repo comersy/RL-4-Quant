@@ -108,7 +108,7 @@ class FCEncoder(nn.Module):
         return self.net(obs)
 
 
-class GRUCell(nn.Module):
+class GRUCell(nn.Module): #Il faudrait peut-être passer par un tenseur pour alpha plutot qu'un scalaire? 
     """
     GRU recurrent module with LEARNED ADAPTIVE DECAY.
     
@@ -202,7 +202,7 @@ class ActorNetwork(nn.Module):
         self.action_type_logits = nn.Linear(prev_size, 3)
 
         # Call or put
-        self.call_or_put_mu = nn.Linear(prev_size, 1)
+        self.call_or_put_mu = nn.Linear(prev_size, 1) #Bizarre de vouloir faire une distribution de call/put: choix binaire, il faudrait plutot Categorical(logits, 2) apres avoir juste nn.Linear(prev_size, 2)
         self.call_or_put_sigma = nn.Linear(prev_size, 1)
 
         # Strike
@@ -306,7 +306,7 @@ class CriticNetwork(nn.Module):
 # ============================================================================
 
 
-class GRUPPOAgent:
+class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les options...
     """
     GRU-PPO Agent with Learned Adaptive Decay Memory.
     
