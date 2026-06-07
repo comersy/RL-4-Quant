@@ -27,7 +27,7 @@
 
 ## Overview
 
-RL-4-Quant is a **proof of concept** for training a reinforcement learning agent to build options trading strategies on a single underlying asset. The agent operates with a fixed budget, can buy or sell calls and puts at various strikes and maturities, and must learn to maximize its total P&L over a trading episode.
+RL-4-Quant is a **proof of concept** for training a reinforcement learning agent to build options trading strategies on a single underlying asset. The agent can buy or sell calls and puts at various strikes and maturities, and must learn to maximize its total P&L over a trading episode.
 
 The core hypothesis: **the more realistic and information-rich the observations, the better the agent's strategies**. This is why the project is structured around progressive phases — starting from minimal simulated data and gradually moving toward real market history enriched with macro, fundamental, and alternative data.
 
