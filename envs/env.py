@@ -61,8 +61,12 @@ Flat float32 vector:
 =============================================================================
 REWARD
 =============================================================================
-Reward is 0 every day, except on the final day (day ) where it equals the
-total realized P&L from all trades during the episode.
+Controlled by REWARD_MODE:
+  "dense"  (default): reward each step = daily change in total P&L
+                      (realized + unrealized). Sums to the same episode total
+                      as "sparse" but gives an immediate per-day signal.
+  "sparse"          : reward is 0 every day except the final day, where it
+                      equals the total P&L accumulated during the episode.
 
 =============================================================================
 """
@@ -85,6 +89,20 @@ from envs.pricing import black_scholes
 EPISODE_DAYS  = 150       # length of an episode in calendar days
 SPOT_HISTORY  = 365       # days of past spot shown in observation
 MAX_PORTFOLIO = 100     # max open positions to track
+
+# Number of decision steps per calendar day. With 1, one order/day (legacy
+# behaviour). With N > 1, the agent gets N decisions on the SAME day's prices
+# before the day advances — i.e. it can trade several times per day.
+TRADES_PER_DAY = 1
+# Rollout length in steps (what the training loop should iterate over).
+EPISODE_STEPS = EPISODE_DAYS * TRADES_PER_DAY
+
+# Reward shaping:
+#   "dense"  -> reward[t] = daily change in total P&L (realized + unrealized).
+#              Sums (telescopes) to the same episode total as "sparse" but gives
+#              an immediate signal each day → far easier credit assignment.
+#   "sparse" -> reward only on the final step = total P&L (original behaviour).
+REWARD_MODE = "dense"
 
 
 class OptionsEnv(gym.Env):
@@ -120,11 +138,13 @@ class OptionsEnv(gym.Env):
         self.start_day_idx = 0
         self.current_day_idx = 0
         self.episode_day = 0
+        self.intraday_step = 0
         self.current_data = None
         self.spot_history = []
         self.portfolio = []
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
+        self.prev_total_pnl = 0.0
         self.today_options = []
 
         # Action space: continuous dict matching train.py
@@ -165,6 +185,7 @@ class OptionsEnv(gym.Env):
         self.start_day_idx = int(self.np_random.integers(min_start, max_start + 1))
         self.current_day_idx = self.start_day_idx
         self.episode_day = 0
+        self.intraday_step = 0
 
         self.portfolio = []
         self.realized_pnl = 0.0
@@ -182,28 +203,44 @@ class OptionsEnv(gym.Env):
         # (For testing/evaluation, not for training)
         if self.init_random_positions:
             self._initialize_random_positions()
-        
+
+        # Baseline for the dense reward: P&L at episode start (the initial
+        # endowment must not be rewarded, only changes from here on).
+        self.prev_total_pnl = float(self.realized_pnl) + float(self.unrealized_pnl)
+
         return self._get_obs(), {}
 
     # ── Step ──────────────────────────────────────────────────────────────────
 
     def step(self, action):
-        """Execute one trading day."""
-        self._execute_action(action)
+        """
+        Execute one decision step.
 
-        self.current_day_idx += 1
-        self.episode_day += 1
-        self._load_current_day()
-        self._mark_to_market()
+        A calendar day is split into TRADES_PER_DAY decision steps: the agent can
+        place several orders on the SAME day's prices before the day advances. The
+        day only rolls forward (reload data + mark-to-market) once all the intra-day
+        steps are consumed. With TRADES_PER_DAY == 1 this is exactly one step/day.
+        """
+        self._execute_action(action)
+        self.intraday_step += 1
+
+        if self.intraday_step >= TRADES_PER_DAY:
+            self.intraday_step = 0
+            self.current_day_idx += 1
+            self.episode_day += 1
+            self._load_current_day()
+            self._mark_to_market()
 
         terminated = self.episode_day >= EPISODE_DAYS - 1
-        
-        # Reward = realized P&L + unrealized P&L at end of episode
-        # This gives coherent signal on maturity choices (even if beyond episode)
-        if terminated:
-            reward = float(self.realized_pnl) + float(self.unrealized_pnl)
-        else:
-            reward = 0.0
+
+        total_pnl = float(self.realized_pnl) + float(self.unrealized_pnl)
+        if REWARD_MODE == "dense":
+            # Daily change in total P&L. Telescopes to the same episode total as
+            # the sparse reward, but gives an immediate per-day learning signal.
+            reward = total_pnl - self.prev_total_pnl
+        else:  # "sparse": full P&L only on the final step
+            reward = total_pnl if terminated else 0.0
+        self.prev_total_pnl = total_pnl
 
         return self._get_obs(), reward, terminated, False, {}
 
@@ -383,38 +420,18 @@ class OptionsEnv(gym.Env):
         self.portfolio.append(position)
 
     def _close_position_by_maturity(self):
-        """Close oldest positions by maturity."""
-        day_today = datetime.strptime(self.all_days[self.current_day_idx], "%Y-%m-%d")
-        
-        remaining = []
-        for p in self.portfolio:
-            if p["expiry"] <= day_today:
-                self._realize_pnl(p)
-            else:
-                remaining.append(p)
-        
-        self.portfolio = remaining
+        """
+        Close ALL open positions at their current mark-to-market price.
 
-    def _realize_pnl(self, position):
-        """Realize profit/loss for a closed position."""
-        entry = position["entry_price"]
-        quantity = position["quantity"]
-        
-        spot = self.current_data["spot"] if self.current_data["spot"] is not None else self.spot_history[-1]
-        
-        # Intrinsic value at expiry
-        strike = position["strike"]
-        if position["option_type"] == "call":
-            payoff = max(spot - strike, 0.0)
-        else:
-            payoff = max(strike - spot, 0.0)
-        
-        if position["is_short"]:
-            pnl = (entry - payoff) * quantity
-        else:
-            pnl = (payoff - entry) * quantity
-        
-        self.realized_pnl += pnl
+        Each position is realized as the P&L accrued since entry
+        (sign * (mark_price - entry_price) * quantity), in BTC, then removed
+        from the portfolio. This gives the agent a real exit lever before
+        expiry instead of only cleaning up already-expired contracts.
+        """
+        for p in self.portfolio:
+            sign = -1 if p["is_short"] else 1
+            self.realized_pnl += sign * (p["price"] - p["entry_price"]) * p["quantity"]
+        self.portfolio = []
 
     # ── Mark to market ────────────────────────────────────────────────────────
 
@@ -432,7 +449,11 @@ class OptionsEnv(gym.Env):
                               else max(p["strike"] - spot, 0.0))
                 payoff_btc = payoff_usd / spot if spot > 0 else 0.0
                 sign       = -1 if p["is_short"] else 1
-                self.realized_pnl += sign * payoff_btc * p["quantity"]
+                # Realize P&L net of the entry premium (both in BTC): for a long
+                # the true result at expiry is payoff - premium, for a short it
+                # is premium - payoff. Without the premium term the reward was
+                # systematically biased.
+                self.realized_pnl += sign * (payoff_btc - p["entry_price"]) * p["quantity"]
                 p["expired"] = True
                 continue
 

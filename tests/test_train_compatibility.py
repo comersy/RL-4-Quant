@@ -1,6 +1,6 @@
 import numpy as np
 
-from envs.env import OptionsEnv
+from envs.env import EPISODE_STEPS, OptionsEnv
 from RL_model.train import CONFIG, GRUPPOAgent, build_env_and_agent
 
 
@@ -76,4 +76,4 @@ def test_default_training_components_are_wired_to_options_env():
 
     assert isinstance(env, OptionsEnv)
     assert agent.obs_dim == env.observation_space.shape[0]
-    assert config["episode_length"] <= 150
+    assert config["episode_length"] == EPISODE_STEPS

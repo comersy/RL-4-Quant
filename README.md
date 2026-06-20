@@ -80,7 +80,7 @@ At each timestep, the agent outputs a **hierarchical action space**:
 |-----------|------|-------|
 | **Primary decision** | Discrete (0-2) | 0 = do nothing, 1 = trade, 2 = close positions |
 | **IF action_type = 1 (trade):** | | |
-| `call_or_put` | Continuous → [0, 1] | 0 = call, 1 = put |
+| `call_or_put` | Discrete (Categorical) | 1 = call, 0 = put (env treats `> 0` as call) |
 | `strike` | Continuous | Unbounded (relative to current spot, e.g. moneyness) |
 | `maturity` | Discrete | [1, T_remaining] (days) |
 | `quantity_signed` | Continuous | Unbounded; **positive = long/buy, negative = short/sell** |
@@ -93,12 +93,12 @@ A flat float32 vector includes:
 
 **Market State** (2 values)
 - Current BTC spot price (USD)
-- Day index within episode (0–89)
+- Day index within episode (0–149)
 
 **Price History** (365 values)
 - Past 365 days of BTC spot prices (for trend/volatility context)
 
-**Tradable Options** (500 × 6 = 3,000 values, padded)
+**Tradable Options** (MAX_OPTIONS × 6, padded — currently ~967 × 6)
 For each available option on the day:
 - Call/put flag (1.0 or 0.0)
 - Strike price
@@ -107,7 +107,7 @@ For each available option on the day:
 - Implied volatility (%)
 - Volume traded
 
-**Open Positions** (10,000 × 8 = 80,000 values, padded)
+**Open Positions** (MAX_PORTFOLIO × 8 = 100 × 8 = 800 values, padded)
 For each position in agent's portfolio:
 - Call/put flag
 - Strike price
@@ -122,7 +122,7 @@ For each position in agent's portfolio:
 - Total realized P&L (from closed positions)
 - Total unrealized P&L (from open positions)
 
-**Total observation dimension**: ~86,000 values
+**Total observation dimension**: 2 + 365 + MAX_OPTIONS·6 + 100·8 + 2 ≈ **6,971 values** (depends on MAX_OPTIONS). Raw values are normalized online (running mean/std) before the encoder.
 
 ### Reward Function
 
@@ -213,8 +213,10 @@ Observation (t)
       │
       ▼
 ┌──────────────────────────┐
-│    FC Encoder            │   Raw obs → latent representation
-│  [obs_dim → 256 → 128]   │   Normalizes and projects observation
+│   Set Encoder (DeepSets)  │  Slice obs into blocks; per-feature RunningNorm;
+│  options/positions →      │  shared token-MLP per option/position + masked
+│  token-MLP + mask + pool  │  mean‖max pooling (permutation-invariant, no pad)
+│  → concat → [→ … → 128]   │  → latent representation
 └────────────┬─────────────┘
              │ encoded_t
              ▼
@@ -270,7 +272,7 @@ Observation (t)
 
 **Key Components:**
 
-1. **FC Encoder** → Projects raw observation to latent space
+1. **Set Encoder (DeepSets)** → Normalizes per-feature, encodes the options/positions sets with a shared token-MLP, masks padding, mean‖max pools (permutation-invariant), then projects to latent space
 2. **GRU Cell with Decay Network** → The core innovation
    - Standard `GRUCell` produces `h_raw`
    - **Decay MLP** learns context-dependent forget factor `α_t`
@@ -391,9 +393,14 @@ RL-4-Quant/
 │   │                              # - Training loop with GAE, PPO clipping
 │   └── __init__.py
 │
-├── test_env_train_compatibility.py # Verify environment ↔ agent integration
-├── test_random_positions.py        # Test random position initialization
-└── test_debug_integration.py       # Debug agent-env interaction
+├── RL_model/
+│   ├── train.py                    # Single-process GRU-PPO trainer
+│   └── train_multi_coeurs.py       # Multi-worker (IMPALA-style) GRU-PPO trainer
+│
+└── tests/
+    ├── test_env.py                 # Environment reset/step/observation contract
+    ├── test_train_compatibility.py # Verify environment ↔ agent integration
+    └── test_tensorboard.py         # Training-loop logging
 ```
 
 **Key Files:**
@@ -429,8 +436,8 @@ source .venv/bin/activate
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Run compatibility tests
-python test_env_train_compatibility.py
+# 3. Run the test suite
+pytest
 
 # 4. Train the agent
 #    (See RL_model/train.py for training configuration)
@@ -480,4 +487,4 @@ env_eval = OptionsEnv(init_random_positions=True)
 
 ---
 
-**Questions or issues?** Check the [compatibility tests](test_env_train_compatibility.py) or review the [environment documentation](envs/env.py).
+**Questions or issues?** Check the [compatibility tests](tests/test_train_compatibility.py) or review the [environment documentation](envs/env.py).

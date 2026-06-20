@@ -22,9 +22,16 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import Normal, Categorical
 from collections import deque, namedtuple
+from datetime import datetime
 import os
+import sys
 from pathlib import Path
-from envs.env import EPISODE_DAYS, OptionsEnv
+
+# Allow running this file directly (`python RL_model/train.py`): put the project
+# root on sys.path so `envs` / `data` are importable.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from envs.env import EPISODE_STEPS, MAX_PORTFOLIO, SPOT_HISTORY, OptionsEnv
 
 # ============================================================================
 # Configuration
@@ -44,7 +51,7 @@ CONFIG = {
     "ppo_clip": 0.15,  # PPO clipping coefficient
     "batch_size": 256,  # episode batch size for update
     "buffer_capacity": 300,  # number of episodes to store
-    "episode_length": 150,
+    "episode_length": EPISODE_STEPS,  # = EPISODE_DAYS * TRADES_PER_DAY
     "entropy_coef": 0.07,  # entropy regularization
     "vf_coef": 0.5,  # value function loss coefficient
     "max_grad_norm": 0.5,  # gradient clipping
@@ -91,21 +98,156 @@ class EpisodeBuffer:
 # ============================================================================
 
 
-class FCEncoder(nn.Module):
-    """Fully connected encoder: raw observation → latent"""
+class RunningNorm(nn.Module):
+    """
+    Online observation normalizer (Welford running mean/variance).
 
-    def __init__(self, obs_dim, hidden_sizes):
+    Raw observations contain BTC spot/strikes (~1e4-1e5), P&L, IV, etc. Feeding
+    those magnitudes straight into a Linear+ReLU encoder makes training unstable.
+    Statistics are updated only during rollout (get_action) and frozen during the
+    PPO update so the normalization is consistent across a minibatch. The stats
+    live in buffers, so they are saved/loaded with the model and never receive
+    gradients.
+    """
+
+    def __init__(self, dim, eps=1e-5):
         super().__init__()
-        layers = []
-        prev_size = obs_dim
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(prev_size, hidden_size))
-            layers.append(nn.ReLU())
-            prev_size = hidden_size
-        self.net = nn.Sequential(*layers)
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("var", torch.ones(dim))
+        self.register_buffer("count", torch.tensor(eps))
 
-    def forward(self, obs):
-        return self.net(obs)
+    @torch.no_grad()
+    def update(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        batch_count = x.shape[0]
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean += delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total
+        self.var = m2 / total
+        self.count = total
+
+    def forward(self, x):
+        return torch.clamp((x - self.mean) / torch.sqrt(self.var + 1e-8), -10.0, 10.0)
+
+
+class SetEncoder(nn.Module):
+    """
+    Permutation-invariant (DeepSets) encoder for the flat OptionsEnv observation.
+
+    The flat vector is sliced back into its semantic blocks:
+        [spot, episode_day], spot_history(365),
+        options(max_options x 6), positions(max_portfolio x 8),
+        [realized_pnl, unrealized_pnl]
+
+    Each *set* block (options, positions) is encoded token-by-token with a SHARED
+    MLP, padded rows are masked out, then mean+max pooled into a fixed-size vector.
+    This removes the dependence on option ordering and on the huge zero-padding,
+    which a flat MLP handled very poorly.
+
+    Observations are normalized online (RunningNorm) before encoding; the padding
+    mask is derived from the RAW observation so normalization can't hide it.
+    """
+
+    OPT_FEATS = 6
+    POS_FEATS = 8
+
+    def __init__(self, obs_dim, hidden_sizes, spot_history=SPOT_HISTORY,
+                 max_portfolio=MAX_PORTFOLIO, token_dim=32):
+        super().__init__()
+        self.spot_history = spot_history
+        self.max_portfolio = max_portfolio
+        self.token_dim = token_dim
+
+        n_opt_vals = obs_dim - 2 - spot_history - max_portfolio * self.POS_FEATS - 2
+        assert n_opt_vals > 0 and n_opt_vals % self.OPT_FEATS == 0, \
+            f"obs_dim {obs_dim} incompatible with expected env layout"
+        self.max_options = n_opt_vals // self.OPT_FEATS
+
+        # Block offsets inside the flat vector
+        self.i_hist = 2
+        self.i_opt = self.i_hist + spot_history
+        self.i_pos = self.i_opt + self.max_options * self.OPT_FEATS
+        self.i_pnl = self.i_pos + max_portfolio * self.POS_FEATS
+
+        # Per-block normalization. Crucially the option/position norms are
+        # SHARED across slots (dim = features per token, not per-slot), otherwise
+        # two identical options in different slots would be normalized differently
+        # and the encoding would stop being permutation-invariant.
+        self.scalar_norm = RunningNorm(4)                 # market(2) + pnl(2)
+        self.hist_norm = RunningNorm(spot_history)
+        self.opt_norm = RunningNorm(self.OPT_FEATS)       # shared over option slots
+        self.pos_norm = RunningNorm(self.POS_FEATS)       # shared over position slots
+
+        def token_mlp(in_features):
+            return nn.Sequential(
+                nn.Linear(in_features, token_dim), nn.ReLU(),
+                nn.Linear(token_dim, token_dim), nn.ReLU(),
+            )
+
+        self.opt_mlp = token_mlp(self.OPT_FEATS)
+        self.pos_mlp = token_mlp(self.POS_FEATS)
+        self.hist_mlp = nn.Sequential(nn.Linear(spot_history, 2 * token_dim), nn.ReLU())
+
+        # scalars(4) + hist(2d) + opt pool(2d) + pos pool(2d)
+        concat_dim = 4 + 2 * token_dim + 2 * token_dim + 2 * token_dim
+        layers, prev = [], concat_dim
+        for hidden_size in hidden_sizes:
+            layers += [nn.Linear(prev, hidden_size), nn.ReLU()]
+            prev = hidden_size
+        self.proj = nn.Sequential(*layers)
+
+    @staticmethod
+    def _masked_pool(tokens, mask):
+        """tokens: (B, N, d), mask: (B, N) in {0,1} → (B, 2d) [mean ‖ max]."""
+        mask_f = mask.unsqueeze(-1)
+        count = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        mean = (tokens * mask_f).sum(dim=1) / count
+        masked = tokens.masked_fill(mask_f == 0, torch.finfo(tokens.dtype).min)
+        mx = masked.max(dim=1).values
+        no_valid = (mask.sum(dim=1) == 0).unsqueeze(-1)
+        mean = torch.where(no_valid, torch.zeros_like(mean), mean)
+        mx = torch.where(no_valid, torch.zeros_like(mx), mx)
+        return torch.cat([mean, mx], dim=-1)
+
+    def forward(self, obs, update_stats=False):
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+
+        # Slice blocks from the RAW observation.
+        scalars_raw = torch.cat([obs[:, 0:2], obs[:, self.i_pnl:self.i_pnl + 2]], dim=-1)
+        hist_raw = obs[:, self.i_hist:self.i_opt]
+        opt_raw = obs[:, self.i_opt:self.i_pos].reshape(-1, self.max_options, self.OPT_FEATS)
+        pos_raw = obs[:, self.i_pos:self.i_pnl].reshape(-1, self.max_portfolio, self.POS_FEATS)
+
+        # Padding masks (a padded row is all zeros; a real one has strike > 0).
+        opt_mask = (opt_raw.abs().sum(dim=-1) > 0).float()
+        pos_mask = (pos_raw.abs().sum(dim=-1) > 0).float()
+
+        if update_stats:
+            self.scalar_norm.update(scalars_raw)
+            self.hist_norm.update(hist_raw)
+            valid_opt = opt_raw[opt_mask.bool()]   # only real options feed the shared stats
+            valid_pos = pos_raw[pos_mask.bool()]
+            if valid_opt.numel() > 0:
+                self.opt_norm.update(valid_opt)
+            if valid_pos.numel() > 0:
+                self.pos_norm.update(valid_pos)
+
+        scalars = self.scalar_norm(scalars_raw)
+        hist = self.hist_mlp(self.hist_norm(hist_raw))
+        opt_tok = self.opt_mlp(self.opt_norm(opt_raw))
+        pos_tok = self.pos_mlp(self.pos_norm(pos_raw))
+        opt_pool = self._masked_pool(opt_tok, opt_mask)
+        pos_pool = self._masked_pool(pos_tok, pos_mask)
+
+        feat = torch.cat([scalars, hist, opt_pool, pos_pool], dim=-1)
+        return self.proj(feat)
 
 
 class GRUCell(nn.Module): #Il faudrait peut-être passer par un tenseur pour alpha plutot qu'un scalaire? 
@@ -268,6 +410,50 @@ class ActorNetwork(nn.Module):
             "log_prob": log_prob,
         }
 
+    def evaluate(self, h_gru, action):
+        """
+        Re-evaluate a *stored* action under the current policy.
+
+        This is what PPO actually needs: log_prob(stored_action | current_policy)
+        so that ratio = exp(new_log_prob - old_log_prob) compares the same action.
+        The forward() path re-samples a fresh action, which would make the ratio
+        meaningless. Returns (log_prob, entropy), both shaped (batch,).
+        """
+        x = self.common(h_gru)
+
+        action_type_dist = Categorical(logits=self.action_type_logits(x))
+        action_type = action["action_type"].long().reshape(-1)
+        log_prob_action_type = action_type_dist.log_prob(action_type)
+
+        call_or_put_dist = Categorical(logits=self.call_or_put(x))
+        log_prob_call_or_put = call_or_put_dist.log_prob(action["call_or_put"].long().reshape(-1))
+
+        strike_mu = self.strike_mu(x)
+        strike_sigma = F.softplus(self.strike_sigma(x)) + 0.01
+        strike_dist = Normal(strike_mu, strike_sigma)
+        log_prob_strike = strike_dist.log_prob(action["strike"]).sum(dim=-1)
+
+        maturity_dist = Categorical(logits=self.maturity_logits(x))
+        maturity_idx = (action["maturity"].reshape(-1) - 1).long().clamp_(0, self.max_maturity - 1)
+        log_prob_maturity = maturity_dist.log_prob(maturity_idx)
+
+        quantity_mu = self.quantity_mu(x)
+        quantity_sigma = F.softplus(self.quantity_sigma(x)) + 0.01
+        quantity_dist = Normal(quantity_mu, quantity_sigma)
+        log_prob_quantity = quantity_dist.log_prob(action["quantity_signed"]).sum(dim=-1)
+
+        is_trade = (action_type == 1).float()
+        log_prob = log_prob_action_type + is_trade * (
+            log_prob_call_or_put + log_prob_strike + log_prob_maturity + log_prob_quantity
+        )
+        entropy = action_type_dist.entropy() + is_trade * (
+            call_or_put_dist.entropy()
+            + strike_dist.entropy().sum(dim=-1)
+            + maturity_dist.entropy()
+            + quantity_dist.entropy().sum(dim=-1)
+        )
+        return log_prob, entropy
+
 
 class CriticNetwork(nn.Module):
     """
@@ -323,7 +509,9 @@ class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les opt
         self.obs_dim = obs_dim
 
         # Networks
-        self.encoder = FCEncoder(obs_dim, config["encoder_hidden_sizes"]).to(self.device)
+        # SetEncoder owns the observation normalization (RunningNorm) and turns
+        # the flat padded vector into a permutation-invariant latent.
+        self.encoder = SetEncoder(obs_dim, config["encoder_hidden_sizes"]).to(self.device)
         
         # GRU with learned decay (replaces vanilla GRU)
         encoded_dim = config["encoder_hidden_sizes"][-1]
@@ -360,8 +548,8 @@ class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les opt
             if obs.dim() == 1:
                 obs = obs.unsqueeze(0)
 
-            # Encode observation
-            encoded = self.encoder(obs)
+            # Encode observation (updates running normalization stats on fresh data)
+            encoded = self.encoder(obs, update_stats=True)
             
             # GRU forward with learned decay
             # Returns: h_gru_new, alpha (alpha is just for monitoring)
@@ -378,6 +566,20 @@ class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les opt
                               for k, v in action_dict.items()}
 
             return action_dict_np, h_gru_new, value.item()
+
+    def _stored_action_to_tensors(self, action):
+        """Convert a stored (numpy) action dict into batched tensors for evaluate()."""
+        def to_tensor(value, shape):
+            arr = np.atleast_1d(np.asarray(value, dtype=np.float32))
+            return torch.as_tensor(arr, dtype=torch.float32, device=self.device).reshape(shape)
+
+        return {
+            "action_type": to_tensor(action["action_type"], (1,)),
+            "call_or_put": to_tensor(action["call_or_put"], (1,)),
+            "strike": to_tensor(action["strike"], (1, 1)),
+            "maturity": to_tensor(action["maturity"], (1,)),
+            "quantity_signed": to_tensor(action["quantity_signed"], (1, 1)),
+        }
 
     def train_step(self, episodes_batch, config):
         """
@@ -399,84 +601,84 @@ class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les opt
         total_decay_reg = 0.0  # optional: regularize decay to prevent collapse
         num_updates = 0
 
+        params = (
+            list(self.encoder.parameters())
+            + list(self.gru.parameters())
+            + list(self.actor.parameters())
+            + list(self.critic.parameters())
+        )
+
         # PPO epochs: multiple passes over the same batch
         for epoch in range(config["ppo_epochs"]):
             for episode in episodes_batch:
                 if len(episode.transitions) == 0:
                     continue
 
-                h_gru = None #h_gru Initialization at each episode
+                # One full pass over the episode WITHOUT detaching the hidden
+                # state, so gradients flow back through time (BPTT) into the GRU,
+                # the decay network and the encoder. Per-step losses are collected
+                # and back-propagated once at the end of the sequence.
+                h_gru = None
+                policy_losses, value_losses, entropy_terms, decay_terms = [], [], [], []
 
                 for t_idx, transition in enumerate(episode.transitions):
                     obs = torch.FloatTensor(transition.observation).unsqueeze(0).to(self.device)
-                    reward = torch.FloatTensor([transition.reward]).to(self.device)
                     old_log_prob = torch.FloatTensor([_as_scalar(transition.old_log_prob)]).to(self.device)
                     advantage = torch.FloatTensor([episode.advantages[t_idx]]).to(self.device)
                     ret = torch.FloatTensor([[episode.returns[t_idx]]]).to(self.device)
 
-                    # Forward pass:
-                    # 1. Encode observation
-                    encoded = self.encoder(obs)
-                    
-                    # 2. GRU with learned decay (α_t is computed and used internally)
-                    h_gru, alpha_t = self.gru(encoded, h_gru) #Calcul of the new h_gru
-                    h_gru = h_gru.detach() #detach to not backward every days but just the last one
-                    
-                    # 3. Actor outputs action distribution
-                    action_dict = self.actor(h_gru)
-                    
+                    # 1. Encode (frozen norm stats during the update) → 2. GRU (attached for BPTT)
+                    encoded = self.encoder(obs, update_stats=False)
+                    h_gru, alpha_t = self.gru(encoded, h_gru)
+
+                    # 3. Re-evaluate the STORED action under the current policy
+                    action = self._stored_action_to_tensors(transition.action)
+                    log_prob, entropy = self.actor.evaluate(h_gru, action)
+
                     # 4. Critic estimates value
                     value = self.critic(h_gru)
 
                     # ===== Policy Loss (PPO clipping) =====
-                    # Compare new policy log_prob with old to measure policy change
-                    ratio = torch.exp(action_dict["log_prob"] - old_log_prob)
+                    ratio = torch.exp(log_prob - old_log_prob)
                     surr1 = ratio * advantage
                     surr2 = torch.clamp(ratio, 1.0 - config["ppo_clip"],
-                                       1.0 + config["ppo_clip"]) * advantage
-                    policy_loss = -torch.min(surr1, surr2).mean()
-
-                    # ===== Entropy Bonus (exploration) =====
-                    # Encourage diverse actions (especially useful in early training)
-                    entropy_loss = -config["entropy_coef"] * action_dict["log_prob"].mean()
+                                        1.0 + config["ppo_clip"]) * advantage
+                    policy_losses.append(-torch.min(surr1, surr2).mean())
 
                     # ===== Value Function Loss =====
-                    # Train critic to predict returns accurately
-                    value_loss = F.mse_loss(value, ret)
+                    value_losses.append(F.mse_loss(value, ret))
 
-                    # ===== Decay Regularization (optional) =====
-                    # Prevent decay from collapsing to 0 or 1
-                    # Use entropy of alpha distribution: -E[α log α + (1-α) log(1-α)]
+                    # ===== Entropy (true policy entropy, encourages exploration) =====
+                    entropy_terms.append(entropy.mean())
+
+                    # ===== Decay Regularization (prevent α collapse to 0 or 1) =====
                     eps = 1e-6
-                    decay_entropy = -(alpha_t * torch.log(alpha_t + eps) + 
-                                      (1 - alpha_t) * torch.log(1 - alpha_t + eps)).mean()
-                    decay_reg = 0.01 * decay_entropy  # light regularization
-
-                    # ===== Total Loss =====
-                    total_loss = (policy_loss + 
-                                 value_loss * config["vf_coef"] + 
-                                 entropy_loss + 
-                                 decay_reg)
-
-                    # ===== Backward & Optimize =====
-                    self.optimizer.zero_grad()
-                    total_loss.backward()
-                    # Gradient clipping for stability
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.encoder.parameters()) +
-                        list(self.gru.parameters()) +
-                        list(self.actor.parameters()) +
-                        list(self.critic.parameters()),
-                        config["max_grad_norm"]
+                    decay_terms.append(
+                        -(alpha_t * torch.log(alpha_t + eps)
+                          + (1 - alpha_t) * torch.log(1 - alpha_t + eps)).mean()
                     )
-                    self.optimizer.step()
 
-                    # Accumulate metrics
-                    total_policy_loss += policy_loss.item()
-                    total_value_loss += value_loss.item()
-                    total_entropy_loss += entropy_loss.item()
-                    total_decay_reg += decay_reg.item()
-                    num_updates += 1
+                # ===== Aggregate over the sequence and back-propagate once =====
+                policy_loss = torch.stack(policy_losses).mean()
+                value_loss = torch.stack(value_losses).mean()
+                entropy_loss = -config["entropy_coef"] * torch.stack(entropy_terms).mean()
+                decay_reg = 0.01 * torch.stack(decay_terms).mean()
+
+                total_loss = (policy_loss
+                              + value_loss * config["vf_coef"]
+                              + entropy_loss
+                              + decay_reg)
+
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, config["max_grad_norm"])
+                self.optimizer.step()
+
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy_loss += entropy_loss.item()
+                total_decay_reg += decay_reg.item()
+                num_updates += 1
 
         # Return averaged metrics for monitoring
         if num_updates > 0:
@@ -491,7 +693,7 @@ class GRUPPOAgent: # L'agent ne connait pas le prix a laquelle il achete les opt
     def save(self, path):
         """Save all network weights."""
         torch.save({
-            "encoder": self.encoder.state_dict(),
+            "encoder": self.encoder.state_dict(),  # includes RunningNorm buffers
             "gru": self.gru.state_dict(),
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
@@ -698,6 +900,11 @@ def train(env, agent, config, num_episodes=NUM_EPISODES, writer=None):
                 writer.add_scalar("episode/long_positions", final_metrics["portfolio/long_positions"], global_step)
                 writer.add_scalar("episode/short_positions", final_metrics["portfolio/short_positions"], global_step)
 
+                writer.add_scalar("episode/hold_actions", action_counts["hold"], global_step)
+                writer.add_scalar("episode/trade_actions", action_counts["trade"], global_step)
+                writer.add_scalar("episode/close_actions", action_counts["close"], global_step)
+                writer.add_scalar("buffer/size", len(buffer), global_step)
+
             # Train on batch of episodes if buffer is full
             if len(buffer) >= config["batch_size"]:
                 episodes_batch = buffer.sample(config["batch_size"])
@@ -722,7 +929,7 @@ def build_env_and_agent(config=None, init_random_positions=False):
 
 
     run_config = (config or CONFIG).copy()
-    run_config["episode_length"] = min(run_config["episode_length"], EPISODE_DAYS)
+    # episode_length already reflects EPISODE_STEPS (or a smoke-test override).
 
     env = OptionsEnv(init_random_positions=init_random_positions)
     agent = GRUPPOAgent(obs_dim=env.observation_space.shape[0], config=run_config)
@@ -778,6 +985,12 @@ def main(argv=None):
                 "ppo_epochs": 1,
                 "tensorboard_log_dir": None,
             }
+        )
+
+    # Fresh timestamped sub-directory per run so TensorBoard curves don't mix.
+    if run_config.get("tensorboard_log_dir"):
+        run_config["tensorboard_log_dir"] = os.path.join(
+            run_config["tensorboard_log_dir"], datetime.now().strftime("%Y%m%d_%H%M%S")
         )
 
     env, agent, run_config = build_env_and_agent(
