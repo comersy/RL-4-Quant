@@ -10,6 +10,7 @@ Architecture parallèle style IMPALA :
 import argparse
 import time
 from collections import deque, namedtuple
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -25,7 +26,7 @@ from envs.env import EPISODE_DAYS, OptionsEnv
 # Config — changer NUM_WORKERS ici
 # ============================================================================
 
-NUM_WORKERS = 8  # ← sur 16 cœurs : 8 workers + 1 learner + overhead OS
+NUM_WORKERS = 10  # ← sur 16 cœurs : 8 workers + 1 learner + overhead OS
 
 NUM_EPISODES = 100_000
 
@@ -348,6 +349,15 @@ def learner_loop(obs_dim, config, episode_queue, weight_queues, num_episodes):
     episodes_recv = 0
     total_steps = 0
 
+    # TensorBoard
+    writer = None
+    log_dir = config.get("tensorboard_log_dir")
+    if log_dir:
+        from torch.utils.tensorboard import SummaryWriter
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"TensorBoard → {log_dir}")
+
     # broadcast poids initiaux
     init_w = {k: {pk: pv.cpu() for pk, pv in v.state_dict().items()}
               for k, v in nets.items()}
@@ -392,6 +402,15 @@ def learner_loop(obs_dim, config, episode_queue, weight_queues, num_episodes):
                 except Exception: pass
             wq.put(new_w)
 
+        # TensorBoard — chaque update
+        if writer is not None and metrics:
+            writer.add_scalar("loss/policy",  metrics["policy_loss"],  updates)
+            writer.add_scalar("loss/value",   metrics["value_loss"],   updates)
+            writer.add_scalar("loss/entropy", metrics["entropy_loss"], updates)
+            writer.add_scalar("loss/decay",   metrics["decay_reg"],    updates)
+            writer.add_scalar("train/episodes_received", episodes_recv, updates)
+            writer.add_scalar("train/total_steps", total_steps, updates)
+
         if updates % print_every == 0:
             now = time.time()
             elapsed_total = now - t_start
@@ -405,9 +424,14 @@ def learner_loop(obs_dim, config, episode_queue, weight_queues, num_episodes):
                 f"sps {sps_window:6.0f} (avg {sps_total:6.0f}) | "
                 f"loss {metrics.get('policy_loss', 0):.4f}"
             )
+            if writer is not None:
+                writer.add_scalar("train/sps", sps_window, updates)
+                writer.flush()
             t_last = now
             steps_last = total_steps
 
+    if writer is not None:
+        writer.close()
     print(f"Done. {updates} updates, {total_steps:,} steps, "
           f"{total_steps/(time.time()-t_start):.0f} sps avg")
 
@@ -460,6 +484,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=NUM_EPISODES)
     parser.add_argument("--workers",  type=int, default=NUM_WORKERS)
+    parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args(argv)
 
@@ -468,12 +493,15 @@ def main(argv=None):
     args = parse_args(argv)
     cfg = CONFIG.copy()
     cfg["num_workers"] = args.workers
+    if args.no_tensorboard:
+        cfg["tensorboard_log_dir"] = None
     if args.smoke_test:
         cfg.update({
             "encoder_hidden_sizes": [32, 16], "gru_hidden_size": 16,
             "actor_hidden_sizes": [16], "critic_hidden_sizes": [16],
             "episode_length": 2, "batch_size": 1, "buffer_capacity": 4,
             "ppo_epochs": 1, "num_workers": 2, "print_every": 1,
+            "tensorboard_log_dir": None,
         })
     train(cfg, args.episodes)
 
